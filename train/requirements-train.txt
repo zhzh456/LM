@@ -1,0 +1,3 @@
+# Extra deps for train/ (base env should already have lmms-eval + qwen-vl-utils)
+transformers>=4.57.1
+flash-attn>=2.6.0
