@@ -96,7 +96,7 @@ def attach_sparse_attention_modules(
     model: nn.Module,
     *,
     layer_id: int = 0,
-    num_buckets: int = 4096,
+    num_buckets: int = 16384,
     near_tau: float = 128.0,
     wave_period: float = 32.0,
     wave_amp: float = 0.12,

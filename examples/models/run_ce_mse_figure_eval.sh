@@ -16,7 +16,7 @@ cd "${ROOT}"
 
 TASKS="${TASKS:-tomato mmbench_en_dev}"
 MODEL=/home/zhanghao360/model/Qwen3-VL-4B-Instruct
-COMMON="max_pixels=65536,min_pixels=3136,max_num_frames=16,interleave_visuals=False,attn_implementation=flash_attention_2,log_input_length=True,print_generation=True"
+COMMON="max_pixels=12845056,min_pixels=3136,max_num_frames=16,interleave_visuals=False,attn_implementation=flash_attention_2,log_input_length=True,print_generation=True"
 SPARSE_COPY=/tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias_copy.pt
 SPARSE_MSE=/tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias.pt
 DUMP_ROOT=/tmp/attn-dump-ce-mse
@@ -43,7 +43,7 @@ run_sparse() {
   echo "[sparse ${tag}] ${task} weights=${weights} -> ${out}"
   accelerate launch --num_processes=1 --main_process_port="${port}" -m lmms_eval \
     --model qwen3_vl_sparse \
-    --model_args=pretrained=${MODEL},sparse_rel_pos_path=${weights},rel_pos_buckets=4096,${COMMON},save_attn_scores_dir=${out} \
+    --model_args=pretrained=${MODEL},sparse_rel_pos_path=${weights},rel_pos_buckets=16384,${COMMON},save_attn_scores_dir=${out} \
     --tasks "${task}" \
     --batch_size 1 \
     --limit 2 \

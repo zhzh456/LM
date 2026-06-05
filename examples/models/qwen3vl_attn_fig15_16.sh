@@ -17,7 +17,7 @@ SPARSE_DUMP=/tmp/qwen3vl-sparse-attn-scores-fig
 SPARSE_WEIGHTS=/tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias.pt
 MODEL=/home/zhanghao360/model/Qwen3-VL-4B-Instruct
 
-COMMON="max_pixels=65536,min_pixels=3136,max_num_frames=16,interleave_visuals=False,attn_implementation=flash_attention_2,log_input_length=True,print_generation=True"
+COMMON="max_pixels=12845056,min_pixels=3136,max_num_frames=16,interleave_visuals=False,attn_implementation=flash_attention_2,log_input_length=True,print_generation=True"
 
 echo "[1/3] baseline eval (limit 2) -> ${BASELINE_DUMP}"
 accelerate launch --num_processes=1 --main_process_port=12346 -m lmms_eval \
@@ -31,7 +31,7 @@ echo "[2/3] sparse eval (limit 2) -> ${SPARSE_DUMP}"
 echo "  weights: ${SPARSE_WEIGHTS}"
 accelerate launch --num_processes=1 --main_process_port=12347 -m lmms_eval \
   --model qwen3_vl_sparse \
-  --model_args=pretrained=${MODEL},sparse_rel_pos_path=${SPARSE_WEIGHTS},rel_pos_buckets=4096,${COMMON},save_attn_scores_dir=${SPARSE_DUMP} \
+  --model_args=pretrained=${MODEL},sparse_rel_pos_path=${SPARSE_WEIGHTS},rel_pos_buckets=16384,${COMMON},save_attn_scores_dir=${SPARSE_DUMP} \
   --tasks tomato \
   --batch_size 1 \
   --limit 2

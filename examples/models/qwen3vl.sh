@@ -20,7 +20,7 @@ accelerate launch --num_processes=1 --main_process_port=12346 -m lmms_eval \
     --model_args=pretrained=/home/zhanghao360/model/Qwen3-VL-4B-Instruct,max_pixels=12845056,max_num_frames=16,interleave_visuals=False,attn_implementation=flash_attention_2,log_input_length=True,print_generation=True \
     --tasks "tomato" \
     --batch_size 1 \
-    --limit 32
+    --limit 8
 
 # # ---------------------------------------------------------------------------
 # # 1 条样本：第一个 decode token 对历史 key 的 pre-softmax 注意力（按距离 d 聚合）
@@ -33,7 +33,7 @@ accelerate launch --num_processes=1 --main_process_port=12346 -m lmms_eval \
 
 # accelerate launch --num_processes=1 --main_process_port=12347 -m lmms_eval \
 #     --model qwen3_vl \
-#     --model_args=pretrained=/home/zhanghao360/model/Qwen3-VL-4B-Instruct,max_pixels=524288,min_pixels=200704,max_num_frames=16,interleave_visuals=False,attn_implementation=flash_attention_2,log_input_length=True,print_generation=True,save_attn_scores_dir=${BASELINE_ATTN_DUMP} \
+#     --model_args=pretrained=/home/zhanghao360/model/Qwen3-VL-4B-Instruct,max_pixels=12845056,min_pixels=200704,max_num_frames=16,interleave_visuals=False,attn_implementation=flash_attention_2,log_input_length=True,print_generation=True,save_attn_scores_dir=${BASELINE_ATTN_DUMP} \
 #     --tasks tomato \
 #     --batch_size 1 \
 #     --limit 1

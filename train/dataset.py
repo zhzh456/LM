@@ -14,7 +14,7 @@ from lmms_eval.tasks.tomato.utils import NUM_FRAMES, construct_prompt
 DEFAULT_DATASET = "lmms-lab/TOMATO"
 DEFAULT_CACHE_SUBDIR = "TOMATO"
 DEFAULT_SYSTEM_PROMPT = "You are an expert in understanding dynamics of objects."
-DEFAULT_MAX_PIXELS = 131072
+DEFAULT_MAX_PIXELS = 12845056
 QWEN_DEFAULT_MIN_PIXELS = 256 * 28 * 28
 QWEN_FLOOR_MIN_PIXELS = 4 * 28 * 28
 

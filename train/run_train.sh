@@ -21,7 +21,7 @@ fi
 accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   --model_path /home/zhanghao360/model/Qwen3-VL-4B-Instruct \
   --output_dir /tmp/qwen3vl-sparse-attn \
-  --max_pixels 524288 \
+  --max_pixels 12845056 \
   --min_pixels 200704 \
   --num_frames 16 \
   --rel_pos_buckets 16384 \

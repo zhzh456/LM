@@ -36,7 +36,7 @@ def main():
     messages = [{"role": "user", "content": visuals + [{"type": "text", "text": text}]}]
 
     processor = AutoProcessor.from_pretrained(
-        args.model_path, max_pixels=65536, min_pixels=3136, trust_remote_code=True
+        args.model_path, max_pixels=12845056, min_pixels=3136, trust_remote_code=True
     )
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         args.model_path, torch_dtype=torch.bfloat16, device_map="cuda:0",

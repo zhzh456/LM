@@ -77,7 +77,7 @@ class Qwen3_VL(lmms):
         use_cache=True,
         attn_implementation: Optional[str] = None,
         min_pixels: int = 256 * 28 * 28,
-        max_pixels: int = 1605632,
+        max_pixels: int = 12845056,
         total_pixels: Optional[int] = None,
         max_num_frames: int = 16,
         fps: Optional[float] = None,

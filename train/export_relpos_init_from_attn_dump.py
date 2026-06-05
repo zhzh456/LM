@@ -53,7 +53,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--sample-dir", type=Path, required=True, help="e.g. /tmp/.../sample_00000")
     p.add_argument("--output", type=Path, default=Path("/tmp/baseline_relpos_scores.pt"))
-    p.add_argument("--num-buckets", type=int, default=4096)
+    p.add_argument("--num-buckets", type=int, default=16384)
     args = p.parse_args()
     n = export_sample_dir(args.sample_dir, args.output, args.num_buckets)
     print(f"saved {n} heads -> {args.output}", flush=True)

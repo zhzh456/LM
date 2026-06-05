@@ -37,7 +37,7 @@ def setup_sparse_attention_for_eval(
     model: torch.nn.Module,
     *,
     rel_pos_path: str,
-    rel_pos_buckets: int = 4096,
+    rel_pos_buckets: int = 16384,
     layer_id: int = 0,
     save_attn_scores_dir: str | None = None,
 ) -> None:
