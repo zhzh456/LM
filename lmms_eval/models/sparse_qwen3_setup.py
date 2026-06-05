@@ -41,7 +41,7 @@ def setup_sparse_attention_for_eval(
     layer_id: int = 0,
     save_attn_scores_dir: str | None = None,
 ) -> None:
-    """Eval: one layer uses sparse decode; others keep default attention."""
+    """Eval: one layer uses sparse pre-RoPE attention; others keep default."""
     (
         _iter_text_attention_modules,
         patch_model_for_sparse_eval,
@@ -68,6 +68,6 @@ def setup_sparse_attention_for_eval(
     from loguru import logger
 
     logger.info(
-        f"[sparse_attn] eval layer_id={layer_id}: prefill=full QK, decode=rel-pos | "
+        f"[sparse_attn] eval layer_id={layer_id}: f(d)*Q_pre*K_pre/sqrt(d) prefill+decode | "
         f"loaded {loaded} head vectors from {rel_pos_path}",
     )

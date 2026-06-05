@@ -12,11 +12,10 @@ from lmms_eval.models.sparse_qwen3_setup import setup_sparse_attention_for_eval
 @register_model("qwen3_vl_sparse")
 class Qwen3_VL_Sparse(Qwen3_VL):
     """
-    Eval: one text layer (sparse_layer_id) uses sparse decode rel-pos; others use default attention.
-    Training uses train_layer_id (see train/patch_sparse_attn.py).
+    Eval: sparse_layer_id uses f(d) * Q_pre * K_pre / sqrt(d) (prefill + decode).
+    Other layers use default attention. Training uses train_layer_id (train/patch_sparse_attn.py).
 
-    Default attn_implementation=flash_attention_2 on non-sparse layers;
-    sparse_layer_id uses custom rel-pos forward.
+    Default attn_implementation=flash_attention_2 on non-sparse layers.
     """
 
     def __init__(

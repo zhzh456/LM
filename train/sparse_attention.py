@@ -284,8 +284,9 @@ def _sparse_pre_softmax_scores(
     from transformers.models.qwen3_vl.modeling_qwen3_vl import repeat_kv
 
     n_heads = rel_pos_bias.size(0)
-    pos = build_relative_position_bias(rel_pos_bias, q_len, kv_len).to(dtype)
-    pos = pos.to(rel_pos_bias.device)
+    pos = build_relative_position_bias(rel_pos_bias, q_len, kv_len).to(
+        device=query.device, dtype=dtype
+    )
     if batch_size > 1:
         pos = pos.expand(batch_size, -1, -1, -1).contiguous()
 

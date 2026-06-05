@@ -15,7 +15,6 @@ from sparse_attention import (
     PerHeadRelativePositionBias,
     attention_scores_distillation_loss,
     dense_eager_attention_forward,
-    full_qk_eager_attention_forward,
     qk_pre_softmax_scores,
     sparse_eager_attention_forward,
     sparse_scores_only_forward,
@@ -138,6 +137,28 @@ def attach_sparse_attention_modules(
 
 def _get_stacked_rel_pos_bias(attn: nn.Module) -> torch.Tensor:
     return attn.rel_pos_bias_per_head.stacked()
+
+
+def reset_sparse_pre_rope_key_caches(model: nn.Module) -> None:
+    """Clear per-layer pre-RoPE K cache before a new generate() / sample."""
+    for attn in _iter_text_attention_modules(model):
+        if hasattr(attn, "_pre_rope_key_cache"):
+            attn._pre_rope_key_cache = None
+
+
+def _wrap_generate_reset_pre_rope_cache(model: nn.Module) -> None:
+    """Reset pre-RoPE K cache at the start of each model.generate() call."""
+    if getattr(model, "_sparse_generate_reset_wrapped", False):
+        return
+
+    _orig_generate = model.generate
+
+    def generate(*args, **kwargs):
+        reset_sparse_pre_rope_key_caches(model)
+        return _orig_generate(*args, **kwargs)
+
+    model.generate = generate
+    model._sparse_generate_reset_wrapped = True
 
 
 def _assemble_pre_rope_keys(
@@ -267,40 +288,18 @@ def _patch_attention_forward(attn: nn.Module) -> None:
                 self._sparse_distill_loss = None
             attn_output = sparse_out
         else:
+            # Eval inference: prefill + decode both use f(d) * Q_pre * K_pre / sqrt(d).
             dropout = 0.0 if not self.training else self.attention_dropout
-            sparse_decode_only = getattr(self, "sparse_decode_only", False)
-            if sparse_decode_only and query_states.size(-2) == 1:
-                attn_output, _ = dense_eager_attention_forward(
-                    self,
-                    query_pre_rope,
-                    key_pre_rope,
-                    value_states,
-                    attention_mask,
-                    self.scaling,
-                    dropout=dropout,
-                    rel_pos_bias=rel_bias,
-                )
-            elif sparse_decode_only:
-                attn_output, _ = full_qk_eager_attention_forward(
-                    self,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    self.scaling,
-                    dropout=dropout,
-                )
-            else:
-                attn_output, _ = dense_eager_attention_forward(
-                    self,
-                    query_pre_rope,
-                    key_pre_rope,
-                    value_states,
-                    attention_mask,
-                    self.scaling,
-                    dropout=dropout,
-                    rel_pos_bias=rel_bias,
-                )
+            attn_output, _ = dense_eager_attention_forward(
+                self,
+                query_pre_rope,
+                key_pre_rope,
+                value_states,
+                attention_mask,
+                self.scaling,
+                dropout=dropout,
+                rel_pos_bias=rel_bias,
+            )
             self._sparse_distill_loss = None
             self._sparse_kl_loss = None
             self._sparse_mse_loss = None
@@ -338,13 +337,15 @@ def patch_model_for_sparse_eval(
     layer_id: int = 0,
     **attach_kwargs,
 ) -> None:
-    """Eval-only: one layer uses sparse decode; other layers keep default attention."""
+    """Eval-only: one layer uses sparse pre-RoPE attention; others keep default."""
     attach_sparse_attention_modules(model, layer_id=layer_id, **attach_kwargs)
     for layer_idx, attn in enumerate(_iter_text_attention_modules(model)):
         if layer_idx != layer_id:
             continue
         attn.sparse_decode_only = True
         _patch_attention_forward(attn)
+    reset_sparse_pre_rope_key_caches(model)
+    _wrap_generate_reset_pre_rope_cache(model)
 
 
 def collect_sparse_distill_loss(model: nn.Module) -> torch.Tensor | None:

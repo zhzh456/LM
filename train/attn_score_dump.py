@@ -37,6 +37,9 @@ def enable_attn_score_dump(
 
 
 def begin_attn_score_sample(model: nn.Module, sample_idx: int) -> None:
+    from patch_sparse_attn import reset_sparse_pre_rope_key_caches
+
+    reset_sparse_pre_rope_key_caches(model)
     model._attn_dump_buffer = []
     model._attn_dump_sample_idx = sample_idx
     model._attn_dump_decode_fwd = 0
