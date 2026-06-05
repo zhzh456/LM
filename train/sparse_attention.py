@@ -360,13 +360,47 @@ def sparse_eager_attention_forward(
 
     distill = None
     if return_distill_tensors:
-        distill = {
-            "full_weights": full_weights,
-            "sparse_weights": attn_weights,
-            "attn_scores": attn_scores,
-        }
+        # Only scores are needed for MSE distill; avoid keeping duplicate weight tensors.
+        distill = {"attn_scores": attn_scores}
 
     return attn_output, attn_weights, distill
+
+
+def sparse_scores_only_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    *,
+    rel_pos_bias: torch.Tensor,
+) -> Tuple[torch.Tensor, None, dict]:
+    """
+    Distill-only training: compute pre-softmax scores only.
+
+    Skips softmax @ V (loss does not depend on attention output). Saves large
+    (B, H, Q, K) weight tensors and their backward buffers at long seq_len.
+    """
+    batch_size = query.size(0)
+    q_len = query.size(-2)
+    kv_len = key.size(-2)
+
+    attn_scores = _sparse_pre_softmax_scores(
+        module,
+        query,
+        key,
+        rel_pos_bias,
+        batch_size,
+        q_len,
+        kv_len,
+        scaling,
+        attention_mask=attention_mask,
+        dtype=query.dtype,
+    )
+
+    b, h, q, d = query.shape
+    dummy = torch.zeros(b, q, h * d, device=query.device, dtype=query.dtype)
+    return dummy, None, {"attn_scores": attn_scores}
 
 
 def attention_distillation_loss(
@@ -492,6 +526,8 @@ def attention_scores_distillation_loss(
     full_scores: torch.Tensor,
     sparse_scores: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
+    *,
+    query_chunk_size: int = 512,
 ) -> torch.Tensor:
     """
     MSE on pre-softmax logits (sparse: rel_pos[d]×QK vs teacher QK).
@@ -499,8 +535,8 @@ def attention_scores_distillation_loss(
     Valid pairs match forward: causal lower-triangle (k <= q) ∩ attention_mask,
     same visible region as full (teacher) and sparse (student) pre-softmax paths.
     """
-    teacher = full_scores.detach().float()
-    student = sparse_scores.float()
+    teacher = full_scores.detach()
+    student = sparse_scores
     bsz, n_heads, q_len, kv_len = teacher.shape
 
     valid = _build_distill_pair_mask(
@@ -514,7 +550,25 @@ def attention_scores_distillation_loss(
     valid = valid & torch.isfinite(teacher) & torch.isfinite(student)
     if not valid.any():
         return student.sum() * 0.0
-    return F.mse_loss(student[valid], teacher[valid])
+
+    if q_len <= query_chunk_size:
+        return F.mse_loss(student[valid], teacher[valid])
+
+    # Chunked reduction must match global mean over all valid (p,j) pairs.
+    total_sse = student.new_zeros(())
+    total_count = 0
+    for q0 in range(0, q_len, query_chunk_size):
+        q1 = min(q0 + query_chunk_size, q_len)
+        v = valid[:, :, q0:q1, :]
+        if not v.any():
+            continue
+        s = student[:, :, q0:q1, :][v]
+        t = teacher[:, :, q0:q1, :][v]
+        total_sse = total_sse + (s - t).pow(2).sum()
+        total_count += int(v.sum().item())
+    if total_count == 0:
+        return student.sum() * 0.0
+    return total_sse / total_count
 
 
 def full_qk_eager_attention_forward(

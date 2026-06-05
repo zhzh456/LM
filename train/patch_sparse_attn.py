@@ -18,6 +18,7 @@ from sparse_attention import (
     full_qk_eager_attention_forward,
     qk_pre_softmax_scores,
     sparse_eager_attention_forward,
+    sparse_scores_only_forward,
 )
 
 
@@ -180,17 +181,30 @@ def _patch_attention_forward(attn: nn.Module) -> None:
             self, "sparse_decode_only", False
         )
         if sparse_train_layer:
-            sparse_out, _, distill = sparse_eager_attention_forward(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                rel_pos_bias=rel_bias,
-                return_distill_tensors=True,
-            )
+            self._sparse_kl_loss = None
+            self._sparse_mse_loss = None
+            self._sparse_distill_loss = None
+            if self.training:
+                sparse_out, _, distill = sparse_scores_only_forward(
+                    self,
+                    query_states,
+                    key_states,
+                    attention_mask,
+                    self.scaling,
+                    rel_pos_bias=rel_bias,
+                )
+            else:
+                sparse_out, _, distill = sparse_eager_attention_forward(
+                    self,
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    self.scaling,
+                    dropout=0.0 if not self.training else self.attention_dropout,
+                    rel_pos_bias=rel_bias,
+                    return_distill_tensors=True,
+                )
             if run_distill:
                 sparse_scores = distill["attn_scores"]
                 with torch.no_grad():

@@ -241,6 +241,17 @@ class SparseAttentionTrainer(Trainer):
 
         return (loss, outputs) if return_outputs else loss
 
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        if not self.baseline_plain_attention:
+            for attn in iter_attn_with_bias(model):
+                attn._sparse_kl_loss = None
+                attn._sparse_mse_loss = None
+                attn._sparse_distill_loss = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return loss
+
     def log(self, logs: dict, start_time: float | None = None) -> None:
         """Print total loss and each component every logging step."""
         if not logs:

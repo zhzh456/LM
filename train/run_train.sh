@@ -5,6 +5,8 @@ export http_proxy=http://10.229.18.27:8412
 export https_proxy=http://10.229.18.27:8412
 export HTTP_PROXY=http://10.229.18.27:8412
 export HTTPS_PROXY=http://10.229.18.27:8412
+# Reduce CUDA allocator fragmentation (helps large contiguous backward allocs).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 cd "$(dirname "$0")"
 export PYTHONPATH="$(cd .. && pwd):${PYTHONPATH:-}"
@@ -16,6 +18,7 @@ if [[ -n "${RESUME_FROM_CHECKPOINT:-}" && -d "${RESUME_FROM_CHECKPOINT}" ]]; the
   RESUME_ARGS=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
 
+# max_pixels=12845056 (video clips to 786432/frame, seq~6K). Distill uses scores-only path.
 # rel_pos init: /tmp/baseline_relpos_scores.pt (see examples/models/qwen3vl.sh bottom block)
 # checkpoint every 0.25 epoch -> checkpoint-{step}/sparse_rel_pos_bias.pt
 accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
