@@ -107,7 +107,7 @@ def attach_sparse_attention_modules(
     Register PerHeadRelativePositionBias on a single text self-attn layer.
 
     Each head gets its own Parameter of shape (num_buckets,):
-      index d -> bias when (query_pos - key_pos) == d before softmax.
+      index d -> f(d) multiplying pre-RoPE Q·K/sqrt(d) when (query_pos - key_pos) == d.
     """
     trainable: List[nn.Parameter] = []
     n_layers = 0
@@ -140,6 +140,32 @@ def _get_stacked_rel_pos_bias(attn: nn.Module) -> torch.Tensor:
     return attn.rel_pos_bias_per_head.stacked()
 
 
+def _assemble_pre_rope_keys(
+    attn: nn.Module,
+    key_pre_rope_step: torch.Tensor,
+    *,
+    track_cache: bool,
+) -> torch.Tensor:
+    """
+    Build full pre-RoPE K for sparse scores: f(d) * Q_pre * K_pre / sqrt(d).
+
+    Prefill (step has all tokens): use keys from this forward.
+    Decode (one new token): concat cached pre-RoPE keys + new key.
+    """
+    step_len = key_pre_rope_step.size(-2)
+    if step_len > 1:
+        key_pre_rope = key_pre_rope_step
+    else:
+        cached = getattr(attn, "_pre_rope_key_cache", None)
+        if cached is not None:
+            key_pre_rope = torch.cat([cached, key_pre_rope_step], dim=-2)
+        else:
+            key_pre_rope = key_pre_rope_step
+    if track_cache:
+        attn._pre_rope_key_cache = key_pre_rope.detach()
+    return key_pre_rope
+
+
 def set_run_distill_this_step(model: nn.Module, enabled: bool) -> None:
     """Toggle dense teacher forward on the sparse-patched layer only."""
     for attn in _iter_text_attention_modules(model):
@@ -168,11 +194,25 @@ def _patch_attention_forward(attn: nn.Module) -> None:
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
+        # Student sparse scores use pre-RoPE Q/K; teacher uses post-RoPE Q/K.
+        query_pre_rope = query_states
+        key_pre_rope_step = key_states
+
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+        use_sparse = getattr(self, "use_sparse_attention", False)
+        if use_sparse:
+            key_pre_rope = _assemble_pre_rope_keys(
+                self,
+                key_pre_rope_step,
+                track_cache=getattr(self, "sparse_decode_only", False),
+            )
+        else:
+            key_pre_rope = key_pre_rope_step
 
         rel_bias = _get_stacked_rel_pos_bias(self)
 
@@ -187,8 +227,8 @@ def _patch_attention_forward(attn: nn.Module) -> None:
             if self.training:
                 sparse_out, _, distill = sparse_scores_only_forward(
                     self,
-                    query_states,
-                    key_states,
+                    query_pre_rope,
+                    key_pre_rope,
                     attention_mask,
                     self.scaling,
                     rel_pos_bias=rel_bias,
@@ -196,8 +236,8 @@ def _patch_attention_forward(attn: nn.Module) -> None:
             else:
                 sparse_out, _, distill = sparse_eager_attention_forward(
                     self,
-                    query_states,
-                    key_states,
+                    query_pre_rope,
+                    key_pre_rope,
                     value_states,
                     attention_mask,
                     self.scaling,
@@ -232,8 +272,8 @@ def _patch_attention_forward(attn: nn.Module) -> None:
             if sparse_decode_only and query_states.size(-2) == 1:
                 attn_output, _ = dense_eager_attention_forward(
                     self,
-                    query_states,
-                    key_states,
+                    query_pre_rope,
+                    key_pre_rope,
                     value_states,
                     attention_mask,
                     self.scaling,
@@ -253,8 +293,8 @@ def _patch_attention_forward(attn: nn.Module) -> None:
             else:
                 attn_output, _ = dense_eager_attention_forward(
                     self,
-                    query_states,
-                    key_states,
+                    query_pre_rope,
+                    key_pre_rope,
                     value_states,
                     attention_mask,
                     self.scaling,

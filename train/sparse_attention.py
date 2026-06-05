@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# rel_pos_score_bias[d] = additive logit when (query_pos - key_pos) == d
+# rel_pos[d] = f(d): multiplicative factor on pre-RoPE Q·K/sqrt(d) when (query_pos - key_pos) == d
 REL_POS_BUCKETS = 16384
 
 
@@ -275,11 +275,11 @@ def _sparse_pre_softmax_scores(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """
-    Pre-softmax logits: rel_pos[d] × (Q·K) + attention_mask.
+    Student pre-softmax logits: f(d) × (Q_pre-RoPE · K_pre-RoPE) / sqrt(d) + mask.
 
-    Same distance d can map to different logits because qk[p,j] varies per pair.
+    query/key must be pre-RoPE (caller applies RoPE separately for teacher / dense paths).
     Only rel_pos_bias is trainable; Q/K projections stay frozen (qk detached).
-    Masked / blocked (p, j) pairs are zeroed before multiply, then additive mask.
+    Masked pairs are zeroed before multiply, then additive attention mask.
     """
     from transformers.models.qwen3_vl.modeling_qwen3_vl import repeat_kv
 
@@ -330,7 +330,7 @@ def sparse_eager_attention_forward(
     topk_ratio: float = 0.2,
     return_distill_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[dict]]:
-    """Sparse attention: (rel-pos template per d) × (frozen Q·K) at each (p, j)."""
+    """Sparse attention: f(d) × (pre-RoPE Q·K / sqrt(d)) at each (p, j)."""
     from transformers.models.qwen3_vl.modeling_qwen3_vl import repeat_kv
 
     batch_size = query.size(0)
@@ -445,7 +445,7 @@ def qk_pre_softmax_scores(
     attention_mask: torch.Tensor | None,
     scaling: float,
 ) -> torch.Tensor:
-    """Teacher pre-softmax logits: Q·K + attention_mask (same mask path as student)."""
+    """Teacher pre-softmax logits: RoPE(Q)·RoPE(K) / sqrt(d) + mask (same mask path as student)."""
     from transformers.models.qwen3_vl.modeling_qwen3_vl import repeat_kv
 
     batch_size = query.size(0)
@@ -530,7 +530,7 @@ def attention_scores_distillation_loss(
     query_chunk_size: int = 512,
 ) -> torch.Tensor:
     """
-    MSE on pre-softmax logits (sparse: rel_pos[d]×QK vs teacher QK).
+    MSE on pre-softmax logits (student: f(d)×pre-RoPE QK vs teacher: RoPE QK).
 
     Valid pairs match forward: causal lower-triangle (k <= q) ∩ attention_mask,
     same visible region as full (teacher) and sparse (student) pre-softmax paths.
@@ -613,7 +613,7 @@ def dense_eager_attention_forward(
     *,
     rel_pos_bias: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Eval/decode sparse path: same score formula as training (pos[d] × frozen Q·K)."""
+    """Eval/decode sparse path: same student formula as training (pre-RoPE Q·K)."""
     from transformers.models.qwen3_vl.modeling_qwen3_vl import repeat_kv
 
     batch_size = query.size(0)
