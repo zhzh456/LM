@@ -12,7 +12,7 @@ from lmms_eval.models.sparse_qwen3_setup import setup_sparse_attention_for_eval
 @register_model("qwen3_vl_sparse")
 class Qwen3_VL_Sparse(Qwen3_VL):
     """
-    Eval: sparse_layer_id uses f(d) * Q_pre * K_pre / sqrt(d) (prefill + decode).
+    Eval: sparse_layer_id uses sparse pre-softmax on prefill, full RoPE QK on decode.
     Other layers use default attention. Training uses train_layer_id (train/patch_sparse_attn.py).
 
     Default attn_implementation=flash_attention_2 on non-sparse layers.
@@ -73,8 +73,9 @@ class Qwen3_VL_Sparse(Qwen3_VL):
         )
         self.save_attn_scores_dir = save_attn_scores_dir
 
+        # Patch the same module object used by generate() (unwrap DDP/FSDP if present).
         setup_sparse_attention_for_eval(
-            self._model,
+            self.model,
             rel_pos_path=sparse_rel_pos_path,
             rel_pos_buckets=rel_pos_buckets,
             layer_id=sparse_layer_id,

@@ -21,7 +21,12 @@ def main():
         default="/tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias.pt",
     )
     p.add_argument("--out-dir", default="/tmp/Figure/2")
-    p.add_argument("--max-distance", type=int, default=510, help="Plot d=0..max_distance inclusive")
+    p.add_argument(
+        "--max-distance",
+        type=int,
+        default=6072,
+        help="Plot d=0..max_distance inclusive (default≈train seq_len-1 for TOMATO max_pixels=12845056)",
+    )
     p.add_argument("--max-layers", type=int, default=None, help="If set, only plot layer 0..max_layers-1")
     args = p.parse_args()
     n = args.max_distance + 1
@@ -56,8 +61,8 @@ def main():
         fig, ax = plt.subplots(figsize=(8, 3))
         ax.plot(x, y, linewidth=0.9)
         ax.set_xlabel("relative distance d (q_pos - k_pos)")
-        ax.set_ylabel("pre-softmax score")
-        ax.set_title(f"layer {layer} head {head} ({label}, d=0..{args.max_distance})")
+        ax.set_ylabel("f(d)")
+        ax.set_title(f"layer {layer} head {head} f(d) ({label}, d=0..{args.max_distance})")
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(out_dir / f"layer_{layer:02d}_head_{head:02d}.png", dpi=120)

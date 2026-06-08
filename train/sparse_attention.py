@@ -45,7 +45,7 @@ class PerHeadRelativePositionBias(nn.Module):
     """
     Each attention head has its own trainable vector of length num_buckets (default 16384).
 
-    Index d is the bias added to pre-softmax attention logits when
+    Index d is f(d): multiplicative factor on pre-RoPE Q·K/sqrt(d) when
     (q_pos - k_pos) == d (d=0: same position, d=1: one step back, ...).
     """
 
@@ -132,8 +132,12 @@ def _lower_triangular_pair_mask(
     kv_len: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Causal lower triangle (k <= q), same rule as HF causal_mask_function."""
-    q_idx = torch.arange(q_len, device=device)
+    """Causal lower triangle (k <= q) using absolute key/query positions.
+
+    Prefill/training (q_len == kv_len): q_idx = 0..q_len-1.
+    Decode (q_len == 1, kv_len > 1): q_idx = kv_len-1 so all prior keys are visible.
+    """
+    q_idx = (kv_len - q_len) + torch.arange(q_len, device=device)
     k_idx = torch.arange(kv_len, device=device)
     causal = k_idx.unsqueeze(0) <= q_idx.unsqueeze(1)
     return causal.view(1, 1, q_len, kv_len).expand(batch_size, n_heads, q_len, kv_len)
@@ -173,8 +177,13 @@ def _prepare_additive_attention_mask(
 
     am = attention_mask.to(device=device)
     if am.dim() == 4:
-        if am.size(-2) != q_len or am.size(-1) != kv_len:
-            am = am[..., :q_len, :kv_len]
+        if am.size(-2) > q_len:
+            am = am[..., :q_len, :]
+        if am.size(-1) < kv_len:
+            # Chunked prefill: HF mask covers the current step only; cached keys are valid.
+            am = F.pad(am, (kv_len - am.size(-1), 0), value=0)
+        elif am.size(-1) > kv_len:
+            am = am[..., :kv_len]
         if am.size(0) == 1 and batch_size > 1:
             am = am.expand(batch_size, -1, -1, -1)
         if am.size(1) == 1:

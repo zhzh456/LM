@@ -15,6 +15,7 @@ from sparse_attention import (
     PerHeadRelativePositionBias,
     attention_scores_distillation_loss,
     dense_eager_attention_forward,
+    full_qk_eager_attention_forward,
     qk_pre_softmax_scores,
     sparse_eager_attention_forward,
     sparse_scores_only_forward,
@@ -175,7 +176,11 @@ def _assemble_pre_rope_keys(
     """
     step_len = key_pre_rope_step.size(-2)
     if step_len > 1:
-        key_pre_rope = key_pre_rope_step
+        cached = getattr(attn, "_pre_rope_key_cache", None)
+        if cached is not None and track_cache:
+            key_pre_rope = torch.cat([cached, key_pre_rope_step], dim=-2)
+        else:
+            key_pre_rope = key_pre_rope_step
     else:
         cached = getattr(attn, "_pre_rope_key_cache", None)
         if cached is not None:
@@ -288,18 +293,30 @@ def _patch_attention_forward(attn: nn.Module) -> None:
                 self._sparse_distill_loss = None
             attn_output = sparse_out
         else:
-            # Eval inference: prefill + decode both use f(d) * Q_pre * K_pre / sqrt(d).
+            # Eval: prefill = sparse pre-softmax f(d)*Q_pre*K_pre/sqrt(d); decode = full RoPE QK.
             dropout = 0.0 if not self.training else self.attention_dropout
-            attn_output, _ = dense_eager_attention_forward(
-                self,
-                query_pre_rope,
-                key_pre_rope,
-                value_states,
-                attention_mask,
-                self.scaling,
-                dropout=dropout,
-                rel_pos_bias=rel_bias,
-            )
+            sparse_decode_only = getattr(self, "sparse_decode_only", False)
+            if sparse_decode_only and query_states.size(-2) == 1:
+                attn_output, _ = full_qk_eager_attention_forward(
+                    self,
+                    query_states,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    self.scaling,
+                    dropout=dropout,
+                )
+            else:
+                attn_output, _ = dense_eager_attention_forward(
+                    self,
+                    query_pre_rope,
+                    key_pre_rope,
+                    value_states,
+                    attention_mask,
+                    self.scaling,
+                    dropout=dropout,
+                    rel_pos_bias=rel_bias,
+                )
             self._sparse_distill_loss = None
             self._sparse_kl_loss = None
             self._sparse_mse_loss = None
