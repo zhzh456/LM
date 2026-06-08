@@ -20,7 +20,9 @@ def main() -> None:
     args = parser.parse_args()
 
     obj = torch.load(args.path, map_location="cpu")
-    import pdb; pdb.set_trace()
+    import pdb
+
+    pdb.set_trace()
     if not isinstance(obj, dict):
         print(f"type={type(obj)}")
         return

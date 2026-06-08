@@ -120,7 +120,9 @@ def capture_prefill_last_token_scores(
             past_key_values=None,
             **kwargs,
         ):
-            from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb
+            from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+                apply_rotary_pos_emb,
+            )
 
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, self.head_dim)
@@ -135,22 +137,16 @@ def capture_prefill_last_token_scores(
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
             if past_key_values is not None:
-                key_states, value_states = past_key_values.update(
-                    key_states, value_states, self.layer_idx
-                )
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
             q_len = query_states.size(-2)
             kv_len = key_states.size(-2)
             track_cache = getattr(self, "sparse_decode_only", False)
-            key_pre_rope = _assemble_pre_rope_keys(
-                self, key_pre_rope_step, track_cache=track_cache
-            )
+            key_pre_rope = _assemble_pre_rope_keys(self, key_pre_rope_step, track_cache=track_cache)
             prev_kv = int(captured.get("kv_len", -1)) if "kv_len" in captured else -1
             if kv_len >= prev_kv:
                 rel_bias = _get_stacked_rel_pos_bias(self)
-                b = qk_pre_softmax_scores(
-                    self, query_states, key_states, attention_mask, self.scaling
-                )
+                b = qk_pre_softmax_scores(self, query_states, key_states, attention_mask, self.scaling)
                 s = _sparse_pre_softmax_scores(
                     self,
                     query_pre_rope,
@@ -246,8 +242,7 @@ def plot_and_metrics(
 
         fig, axes = plt.subplots(1, 3, figsize=(18, 4.5))
         fig.suptitle(
-            f"sample {sample_idx} layer {layer_id} head {h} "
-            f"(prefill last token, seq_len={q_pos + 1})",
+            f"sample {sample_idx} layer {layer_id} head {h} " f"(prefill last token, seq_len={q_pos + 1})",
             fontsize=11,
         )
 
@@ -364,9 +359,7 @@ def main():
         inputs = collator([sample])
         inputs.pop("labels", None)
 
-        baseline, sparse, _ = capture_prefill_last_token_scores(
-            model, inputs, layer_id=args.layer_id
-        )
+        baseline, sparse, _ = capture_prefill_last_token_scores(model, inputs, layer_id=args.layer_id)
         plot_and_metrics(
             baseline=baseline,
             sparse=sparse,

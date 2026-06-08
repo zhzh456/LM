@@ -21,10 +21,11 @@ def main():
     args = p.parse_args()
 
     from datasets import load_dataset
-    from lmms_eval.tasks import TaskManager
     from patch_sparse_attn import _iter_text_attention_modules
     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
     from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb
+
+    from lmms_eval.tasks import TaskManager
 
     tm = TaskManager()
     task_dict = tm.load_task_or_group(args.task)
@@ -35,26 +36,35 @@ def main():
     visuals = task.doc_to_visual(doc)
     messages = [{"role": "user", "content": visuals + [{"type": "text", "text": text}]}]
 
-    processor = AutoProcessor.from_pretrained(
-        args.model_path, max_pixels=12845056, min_pixels=3136, trust_remote_code=True
-    )
+    processor = AutoProcessor.from_pretrained(args.model_path, max_pixels=12845056, min_pixels=3136, trust_remote_code=True)
     model = Qwen3VLForConditionalGeneration.from_pretrained(
-        args.model_path, torch_dtype=torch.bfloat16, device_map="cuda:0",
-        trust_remote_code=True, attn_implementation="eager",
+        args.model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="cuda:0",
+        trust_remote_code=True,
+        attn_implementation="eager",
     )
 
     from qwen_vl_utils import process_vision_info
 
     image_inputs, video_inputs, video_kwargs = process_vision_info(
-        messages, return_video_kwargs=True, image_patch_size=16, return_video_metadata=True,
+        messages,
+        return_video_kwargs=True,
+        image_patch_size=16,
+        return_video_metadata=True,
     )
     video_metadata_list = None
     if video_inputs is not None:
         video_inputs, video_metadata_list = map(list, zip(*video_inputs))
     prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     enc = processor(
-        text=[prompt], images=image_inputs, videos=video_inputs,
-        video_metadata=video_metadata_list, **video_kwargs, do_resize=False, return_tensors="pt",
+        text=[prompt],
+        images=image_inputs,
+        videos=video_inputs,
+        video_metadata=video_metadata_list,
+        **video_kwargs,
+        do_resize=False,
+        return_tensors="pt",
     )
     enc = {k: v.to("cuda:0") if hasattr(v, "to") else v for k, v in enc.items()}
 
