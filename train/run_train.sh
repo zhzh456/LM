@@ -19,7 +19,7 @@ if [[ -n "${RESUME_FROM_CHECKPOINT:-}" && -d "${RESUME_FROM_CHECKPOINT}" ]]; the
 fi
 
 # max_pixels=12845056 (video clips to 786432/frame, seq~6K). Distill uses scores-only path.
-# rel_pos: default prior init (exp decay + wave); lr=0.1, 1 epoch.
+# rel_pos: default prior init (exp decay + wave); lr=1, 1 epoch.
 # checkpoint every 0.25 epoch -> checkpoint-{step}/sparse_rel_pos_bias.pt
 accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   --model_path /home/zhanghao360/model/Qwen3-VL-4B-Instruct \
@@ -33,7 +33,7 @@ accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   --num_train_epochs 1 \
   --train_layer_id 0 \
   --attn_implementation flash_attention_2 \
-  --learning_rate 0.1 \
+  --learning_rate 1 \
   --warmup_ratio 0.03 \
   --logging_steps 1 \
   --bf16 \
