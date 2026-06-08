@@ -19,7 +19,7 @@ if [[ -n "${RESUME_FROM_CHECKPOINT:-}" && -d "${RESUME_FROM_CHECKPOINT}" ]]; the
 fi
 
 # max_pixels=12845056 (video clips to 786432/frame, seq~6K). Distill uses scores-only path.
-# rel_pos init: /tmp/baseline_relpos_scores.pt (see examples/models/qwen3vl.sh bottom block)
+# rel_pos: default prior init (exp decay + wave); lr=0.1, 1 epoch.
 # checkpoint every 0.25 epoch -> checkpoint-{step}/sparse_rel_pos_bias.pt
 accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   --model_path /home/zhanghao360/model/Qwen3-VL-4B-Instruct \
@@ -33,18 +33,15 @@ accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   --num_train_epochs 1 \
   --train_layer_id 0 \
   --attn_implementation flash_attention_2 \
-  --learning_rate 1 \
+  --learning_rate 0.1 \
+  --warmup_ratio 0.03 \
   --logging_steps 1 \
   --bf16 \
   --distill_every_n_steps 1 \
   "${RESUME_ARGS[@]}" \
-  --rel_pos_init_path /tmp/baseline_relpos_scores.pt \
   --report_to none \
   --save_every_epoch_fraction 0.25 \
   --save_at_end \
   "$@"
 
-# bash train/run_train.sh --limit 8 --baseline_plain_attention
-# [train] saved to /tmp/qwen3vl-sparse-attn/final
-# bash train/run_train.sh --rel_pos_init_path /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias_copy.pt
 # bash train/run_train.sh --rel_pos_init_path /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias.pt

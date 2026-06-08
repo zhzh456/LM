@@ -64,10 +64,11 @@ def setup_sparse_attention_for_eval(
     if save_attn_scores_dir:
         from attn_score_dump import enable_attn_score_dump
 
-        enable_attn_score_dump(model, save_attn_scores_dir)
+        enable_attn_score_dump(model, save_attn_scores_dir, dump_mode="prefill_last")
     from loguru import logger
 
     logger.info(
-        f"[sparse_attn] eval layer_id={layer_id}: f(d)*Q_pre*K_pre/sqrt(d) prefill+decode | "
+        f"[sparse_attn] eval layer_id={layer_id}: prefill=sparse pre-softmax, decode=full QK | "
+        f"attn dump=prefill_last (Student on sparse layer) | "
         f"loaded {loaded} head vectors from {rel_pos_path}",
     )

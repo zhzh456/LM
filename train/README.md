@@ -2,9 +2,9 @@
 
 在 **TOMATO** 上训练 **稀疏注意力** 模块（**冻结** Qwen3-VL 全部 backbone 权重）：
 
-- **指定一层**（`--train_layer_id`，默认 0）、**每个 attention head** 各有一组可训练参数，默认形状 **`(4096,)`**（4K，`--rel_pos_buckets`）
-  - 第 `d` 维 = 距离 `d` 上的可训练系数；student pre-softmax = **`rel_pos[d] × (Q·K) + mask`**，teacher = **`Q·K + mask`**（同一 `attention_mask`；不可见 \((p,j)\) 在乘积前置零后再加 mask）
-  - 初始化：近距离偏大 `exp(-d/τ)` + 随距离衰减的正弦震荡（每 head 相位不同）
+- **指定一层**（`--train_layer_id`，默认 0）、**每个 attention head** 各有一组可训练参数，默认形状 **`(16384,)`**（16K，`--rel_pos_buckets`）
+  - 第 `d` 维 = 距离 \(d\) 上的可训练系数 \(f(d)\)；student pre-softmax = **`f(d) × Q_pre·K_pre / √d + mask`**（RoPE **之前**的 Q/K），teacher = **`RoPE(Q)·RoPE(K) / √d + mask`**
+  - 初始化：近距离偏大 `exp(-d/τ)` + 随距离衰减的正弦震荡（每 head 相位不同）；也可用 `baseline_relpos_scores.pt`（从全量 attention dump 按距离打包）
   - `d=0`：同位置；`d=1`：相距 1；…（不是每层共用一个参数）
 - 对 query 位置 `p`，使用所有合法历史位置 `0..p` 的相对位置分数（不再做 top-k 截断）
 - 默认损失（`run_train.sh`）：仅 **蒸馏 MSE**（pre-softmax 分数；与全量 teacher 同为因果下三角 mask `k<=q` ∩ `attention_mask`），无语言建模 CE
@@ -83,7 +83,9 @@ bash examples/models/qwen3vl_sparse_attn.sh
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--model_path` | 本地 4B 路径 | 同 `pretrained=` |
-| `--max_pixels` | 65536（`run_train.sh`） | 同 `model_args` 的 `max_pixels` |
+| `--max_pixels` | 12845056（`run_train.sh`） | 同 `model_args` 的 `max_pixels` |
+| `--rel_pos_buckets` | 16384 | 每 head 距离系数长度 |
+| `--learning_rate` | 1（`run_train.sh`） | 仅 rel-pos 可训练；建议扫多组对比 |
 | `--num_frames` | 16（`run_train.sh`） | 同 `max_num_frames`；`min_pixels` 自动为 3136 |
 | `--train_ratio` | 0.9 | test 集划分训练/验证 |
 | `--rel_pos_init_path` | 无 | 可选：从 `.pt` 加载 `layer_{i}.head_{h}` 初始化 rel-pos（训练内不做统计） |
@@ -125,3 +127,15 @@ bash examples/models/qwen3vl_sparse_attn.sh
 3. 当前权重与评测指标是否不应只看 **decode 的第一个 token**？应看 **prefill 的最后一个**，还是 **prefill 的多个位置**？（待统一）
 
 （或者多种组合方式？）
+
+---
+
+## Version 4
+
+1. Student 分数改为 **`f(d) × Q_pre·K_pre / √d + mask`**（RoPE 前的 Q/K；Teacher 仍为 RoPE 后标准 QK）。
+
+2. 对比不同 **初始化**（默认 prior / baseline dump）与 **学习率** 设置。
+
+3. 多模态评测：**prefill 用稀疏 pre-softmax**，**decode 用全量 RoPE QK**。
+
+4. 先在 layer 0 上把训练方式定下来（公式、init、lr、prefill/decode 分工与评测采集），再按同样流程训练其他层。

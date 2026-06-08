@@ -84,6 +84,7 @@ def process_sample(
 
     rows = []
     agg: dict[tuple[int, float], list[float]] = {}
+    per_head_ndcg: dict[tuple[int, int], list[float]] = {}
 
     for layer, head, b_path in iter_layer_heads(b_root):
         if layer >= max_layers:
@@ -93,9 +94,11 @@ def process_sample(
             continue
         _, rel_b, rel_s = load_pair(b_path, s_path)
         n = len(rel_b)
+        ndcg_curve: list[float] = []
         for frac in K_FRACS:
             k = max(1, int(round(n * frac)))
             ndcg = ndcg_sparse_vs_baseline(rel_b, rel_s, k)
+            ndcg_curve.append(ndcg)
             rows.append(
                 {
                     "layer": layer,
@@ -107,6 +110,7 @@ def process_sample(
                 }
             )
             agg.setdefault((layer, frac), []).append(ndcg)
+        per_head_ndcg[(layer, head)] = ndcg_curve
 
     with (out_dir / "ndcg_per_head.csv").open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [])
@@ -131,18 +135,39 @@ def process_sample(
     with (out_dir / "ndcg_summary.json").open("w") as f:
         json.dump(summary, f, indent=2)
 
+    xs = [int(f * 100) for f in K_FRACS]
     for layer in sorted({L for L, _ in agg}):
-        xs = [int(f * 100) for f in K_FRACS]
-        ys = [sum(agg[(layer, f)]) / len(agg[(layer, f)]) for f in K_FRACS]
-        fig, ax = plt.subplots(figsize=(7, 4))
-        ax.plot(xs, ys, "o-", color="#1f77b4", linewidth=1.5, markersize=6)
+        for head, ndcg_curve in sorted(
+            ((h, c) for (l, h), c in per_head_ndcg.items() if l == layer),
+            key=lambda x: x[0],
+        ):
+            fig, ax = plt.subplots(figsize=(7, 4))
+            ax.plot(xs, ndcg_curve, "o-", color="#1f77b4", linewidth=1.5, markersize=5)
+            ax.set_xlabel("K (% of valid positions)")
+            ax.set_ylabel("NDCG@K")
+            ax.set_title(f"sample {sample_id} layer {layer} head {head} (GT=baseline)")
+            ax.set_ylim(0, 1.05)
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(out_dir / f"ndcg_layer_{layer:02d}_head_{head:02d}.png", dpi=120)
+            plt.close(fig)
+
+        mean_ys = [sum(agg[(layer, f)]) / len(agg[(layer, f)]) for f in K_FRACS]
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for head, ndcg_curve in sorted(
+            ((h, c) for (l, h), c in per_head_ndcg.items() if l == layer),
+            key=lambda x: x[0],
+        ):
+            ax.plot(xs, ndcg_curve, linewidth=0.8, alpha=0.45)
+        ax.plot(xs, mean_ys, "k-o", linewidth=2, markersize=6, label="mean over heads")
         ax.set_xlabel("K (% of valid positions)")
         ax.set_ylabel("NDCG@K")
-        ax.set_title(f"sample {sample_id} layer {layer}  (GT=baseline, rank=sparse, mean over heads)")
+        ax.set_title(f"sample {sample_id} layer {layer}: NDCG per head (GT=baseline)")
         ax.set_ylim(0, 1.05)
+        ax.legend(loc="lower right")
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
-        fig.savefig(out_dir / f"ndcg_layer_{layer:02d}.png", dpi=120)
+        fig.savefig(out_dir / f"ndcg_layer_{layer:02d}_all_heads.png", dpi=120)
         plt.close(fig)
 
     print(f"sample {sample_id}: {len(rows)} rows -> {out_dir}")

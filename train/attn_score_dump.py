@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+DumpMode = Literal["decode_first", "prefill_last"]
 
 
 def _iter_text_attention_modules(model: nn.Module):
@@ -20,20 +22,26 @@ def enable_attn_score_dump(
     model: nn.Module,
     dump_dir: str,
     *,
-    decode_only: bool = True,
+    dump_mode: DumpMode = "decode_first",
 ) -> None:
-    """Attach a shared buffer on all language self-attn modules."""
+    """Attach a shared buffer on all language self-attn modules.
+
+    dump_mode:
+      - decode_first: first decode step only (q_len==1), RoPE QK on patched sparse decode.
+      - prefill_last: last prefill query row (max kv_len forward), skip decode steps.
+    """
     path = Path(dump_dir)
     path.mkdir(parents=True, exist_ok=True)
     model._attn_dump_dir = str(path)
     model._attn_dump_buffer: List[Tuple[int, torch.Tensor]] = []
-    model._attn_dump_decode_only = decode_only
+    model._attn_dump_mode: DumpMode = dump_mode
     model._attn_dump_decode_fwd = 0
+    model._attn_dump_prefill_stash: dict[int, dict] = {}
     for layer_idx, attn in enumerate(_iter_text_attention_modules(model)):
         attn._attn_dump_buffer = model._attn_dump_buffer
         attn._attn_dump_root_model = model
         attn._attn_dump_layer_idx = layer_idx
-        attn._attn_dump_decode_only = decode_only
+        attn._attn_dump_mode = dump_mode
 
 
 def begin_attn_score_sample(model: nn.Module, sample_idx: int) -> None:
@@ -43,6 +51,7 @@ def begin_attn_score_sample(model: nn.Module, sample_idx: int) -> None:
     model._attn_dump_buffer = []
     model._attn_dump_sample_idx = sample_idx
     model._attn_dump_decode_fwd = 0
+    model._attn_dump_prefill_stash = {}
     for attn in _iter_text_attention_modules(model):
         attn._attn_dump_buffer = model._attn_dump_buffer
         attn._attn_dump_root_model = model
@@ -52,39 +61,72 @@ def record_pre_softmax_scores(attn_module: nn.Module, scores: torch.Tensor) -> N
     """
     scores: (batch, num_heads, q_len, kv_len) before softmax.
 
-    decode_only=True (default): only the first decode step (q_len==1),
-    i.e. the new token's logits over all prior keys.
+    prefill_last: keep last query row from the forward with largest kv_len (skip decode).
+    decode_first: only the first decode step (q_len==1).
     """
     buf = getattr(attn_module, "_attn_dump_buffer", None)
     if buf is None:
         return
+
     q_len = scores.size(-2)
-    decode_only = getattr(attn_module, "_attn_dump_decode_only", True)
-    if decode_only:
-        if q_len != 1:
-            return
-        root = getattr(attn_module, "_attn_dump_root_model", None)
-        layer_idx = getattr(attn_module, "_attn_dump_layer_idx", 0)
-        if root is not None and layer_idx == 0:
-            root._attn_dump_decode_fwd = getattr(root, "_attn_dump_decode_fwd", 0) + 1
-        fwd = getattr(root, "_attn_dump_decode_fwd", 1) if root is not None else 1
-        if fwd != 1:
-            return
+    kv_len = scores.size(-1)
+    dump_mode: DumpMode = getattr(attn_module, "_attn_dump_mode", "decode_first")
     layer_idx = getattr(attn_module, "_attn_dump_layer_idx", 0)
+    root = getattr(attn_module, "_attn_dump_root_model", None)
+
+    if dump_mode == "prefill_last":
+        if q_len == 1:
+            return
+        if root is None:
+            return
+        stash: dict[int, dict] = getattr(root, "_attn_dump_prefill_stash", {})
+        prev_kv = int(stash.get(layer_idx, {}).get("kv_len", -1))
+        if kv_len >= prev_kv:
+            stash[layer_idx] = {
+                "kv_len": kv_len,
+                "scores": scores[0, :, -1, :].detach().float().cpu().half(),
+            }
+            root._attn_dump_prefill_stash = stash
+        return
+
+    if q_len != 1:
+        return
+    if root is not None and layer_idx == 0:
+        root._attn_dump_decode_fwd = getattr(root, "_attn_dump_decode_fwd", 0) + 1
+    fwd = getattr(root, "_attn_dump_decode_fwd", 1) if root is not None else 1
+    if fwd != 1:
+        return
     buf.append((layer_idx, scores.detach().float().cpu().half()))
 
 
 def flush_attn_score_sample(model: nn.Module) -> Optional[Path]:
     dump_dir = getattr(model, "_attn_dump_dir", None)
-    buffer: List[Tuple[int, torch.Tensor]] = getattr(model, "_attn_dump_buffer", [])
     sample_idx = getattr(model, "_attn_dump_sample_idx", 0)
-    if not dump_dir or not buffer:
+    dump_mode: DumpMode = getattr(model, "_attn_dump_mode", "decode_first")
+    if not dump_dir:
+        return None
+
+    if dump_mode == "prefill_last":
+        stash: dict[int, dict] = getattr(model, "_attn_dump_prefill_stash", {})
+        if not stash:
+            return None
+        out_dir = Path(dump_dir) / f"sample_{sample_idx:05d}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for layer_idx, entry in sorted(stash.items()):
+            scores = entry["scores"]
+            for head_idx in range(scores.size(0)):
+                vec = scores[head_idx].squeeze()
+                torch.save(vec, out_dir / f"layer_{layer_idx:02d}_head_{head_idx:02d}.pt")
+        stash.clear()
+        return out_dir
+
+    buffer: List[Tuple[int, torch.Tensor]] = getattr(model, "_attn_dump_buffer", [])
+    if not buffer:
         return None
 
     out_dir = Path(dump_dir) / f"sample_{sample_idx:05d}"
     out_dir.mkdir(parents=True, exist_ok=True)
     for layer_idx, scores in buffer:
-        # (batch, heads, q, kv) -> per-head; decode: q=1 -> (kv,) vector
         if scores.dim() == 4:
             scores = scores[0]
         for head_idx in range(scores.size(0)):
