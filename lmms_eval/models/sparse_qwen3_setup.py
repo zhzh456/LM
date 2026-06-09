@@ -68,7 +68,5 @@ def setup_sparse_attention_for_eval(
     from loguru import logger
 
     logger.info(
-        f"[sparse_attn] eval layer_id={layer_id}: prefill=sparse pre-softmax, decode=full QK | "
-        f"attn dump=prefill_last (Student on sparse layer) | "
-        f"loaded {loaded} head vectors from {rel_pos_path}",
+        f"[sparse_attn] eval layer_id={layer_id}: prefill=sparse pre-softmax, decode=full QK | " f"attn dump=prefill_last (Student on sparse layer) | " f"loaded {loaded} head vectors from {rel_pos_path}",
     )

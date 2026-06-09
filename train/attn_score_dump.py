@@ -140,7 +140,10 @@ def flush_attn_score_sample(model: nn.Module) -> Optional[Path]:
 
 def patch_baseline_attn_dump(model: nn.Module) -> None:
     """Patch text attention to record standard QK pre-softmax logits (eager path)."""
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import apply_rotary_pos_emb, repeat_kv
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+        apply_rotary_pos_emb,
+        repeat_kv,
+    )
 
     for layer_idx, attn in enumerate(_iter_text_attention_modules(model)):
         if getattr(attn, "_sparse_forward_patched", False):

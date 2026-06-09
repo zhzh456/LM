@@ -73,7 +73,9 @@ def _patch_causal_lm_sparse_forward(model: nn.Module) -> None:
         if getattr(text_model, "_sparse_stop_at_layer_id", None) is None:
             return _orig_forward(*args, labels=labels, logits_to_keep=logits_to_keep, **kwargs)
 
-        from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLCausalLMOutputWithPast
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+            Qwen3VLCausalLMOutputWithPast,
+        )
 
         model_kwargs = {k: v for k, v in kwargs.items() if k != "labels"}
         outputs = self.model(**model_kwargs)
@@ -243,9 +245,7 @@ def _patch_attention_forward(attn: nn.Module) -> None:
         rel_bias = _get_stacked_rel_pos_bias(self)
 
         run_distill = getattr(self, "_run_distill_this_step", True)
-        sparse_train_layer = getattr(self, "use_sparse_attention", False) and not getattr(
-            self, "sparse_decode_only", False
-        )
+        sparse_train_layer = getattr(self, "use_sparse_attention", False) and not getattr(self, "sparse_decode_only", False)
         if sparse_train_layer:
             self._sparse_kl_loss = None
             self._sparse_mse_loss = None
@@ -281,9 +281,7 @@ def _patch_attention_forward(attn: nn.Module) -> None:
                         attention_mask,
                         self.scaling,
                     )
-                loss_out = attention_scores_distillation_loss(
-                    full_scores, sparse_scores, attention_mask
-                )
+                loss_out = attention_scores_distillation_loss(full_scores, sparse_scores, attention_mask)
                 self._sparse_kl_loss = None
                 self._sparse_mse_loss = loss_out
                 self._sparse_distill_loss = loss_out
@@ -419,22 +417,12 @@ def unpack_sparse_rel_pos_checkpoint(
     """Return (meta, tensors). Supports new (_meta) and legacy flat checkpoints."""
     if SPARSE_CKPT_META_KEY in raw:
         meta = dict(raw[SPARSE_CKPT_META_KEY])
-        tensors = {
-            k: v
-            for k, v in raw.items()
-            if k != SPARSE_CKPT_META_KEY and isinstance(v, torch.Tensor)
-        }
+        tensors = {k: v for k, v in raw.items() if k != SPARSE_CKPT_META_KEY and isinstance(v, torch.Tensor)}
         return meta, tensors
 
     tensors = {k: v for k, v in raw.items() if isinstance(v, torch.Tensor)}
     meta: dict = {}
-    layer_ids = sorted(
-        {
-            int(k.split(".")[0].removeprefix("layer_"))
-            for k in tensors
-            if k.startswith("layer_") and ".head_" in k
-        }
-    )
+    layer_ids = sorted({int(k.split(".")[0].removeprefix("layer_")) for k in tensors if k.startswith("layer_") and ".head_" in k})
     if len(layer_ids) == 1:
         meta["train_layer_id"] = layer_ids[0]
     return meta, tensors
@@ -460,9 +448,7 @@ def save_sparse_rel_pos_checkpoint(model: nn.Module, output_dir: str) -> str:
         num_heads = mod.num_heads
         for h, p in enumerate(mod.head_biases):
             tensors[f"layer_{layer_idx}.head_{h}"] = p.detach().cpu()
-        tensors[f"layer_{layer_idx}.sparse_topk_ratio"] = torch.tensor(
-            getattr(attn, "sparse_topk_ratio", 0.2)
-        )
+        tensors[f"layer_{layer_idx}.sparse_topk_ratio"] = torch.tensor(getattr(attn, "sparse_topk_ratio", 0.2))
 
     meta = {
         "format_version": 1,
@@ -480,8 +466,7 @@ def save_sparse_rel_pos_checkpoint(model: nn.Module, output_dir: str) -> str:
         torch.save(payload, alias)
 
     print(
-        f"[save] sparse rel-pos layer={layer_tag} heads={num_heads} "
-        f"buckets={rel_pos_buckets} -> {path}",
+        f"[save] sparse rel-pos layer={layer_tag} heads={num_heads} " f"buckets={rel_pos_buckets} -> {path}",
         flush=True,
     )
     return path
@@ -503,15 +488,9 @@ def load_sparse_rel_pos_checkpoint(
     if saved_layer is not None and expected_layer_id is not None:
         if isinstance(saved_layer, list):
             if expected_layer_id not in saved_layer:
-                raise ValueError(
-                    f"Checkpoint train_layer_id={saved_layer} does not contain "
-                    f"expected layer_id={expected_layer_id} ({path})"
-                )
+                raise ValueError(f"Checkpoint train_layer_id={saved_layer} does not contain " f"expected layer_id={expected_layer_id} ({path})")
         elif int(saved_layer) != int(expected_layer_id):
-            raise ValueError(
-                f"Checkpoint train_layer_id={saved_layer} != "
-                f"expected layer_id={expected_layer_id} ({path})"
-            )
+            raise ValueError(f"Checkpoint train_layer_id={saved_layer} != " f"expected layer_id={expected_layer_id} ({path})")
 
     loaded = 0
     for attn in iter_attn_with_bias(model):

@@ -111,9 +111,7 @@ def mmbench_aggregate_dev_results_eval(results, args):
     try:
         overall_acc, category_acc, l2_category_acc = mmbench_evaluator.eval_result(results, eval_method="openai")
     except Exception as e:
-        eval_logger.warning(
-            f"MMBench OpenAI eval failed ({e}); skipping GPT API and using static MCQ extraction."
-        )
+        eval_logger.warning(f"MMBench OpenAI eval failed ({e}); skipping GPT API and using static MCQ extraction.")
         overall_acc, category_acc, l2_category_acc = mmbench_evaluator.eval_result(results, eval_method="static")
     file = generate_submission_file("mmbench_en_dev_results.json", args)
     details_info = {

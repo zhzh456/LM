@@ -7,8 +7,6 @@ import argparse
 import os
 
 import torch
-from transformers import Qwen3VLForConditionalGeneration, Trainer, TrainerCallback, TrainingArguments
-
 from collator import Qwen3VLDataCollator
 from dataset import (
     DEFAULT_MAX_PIXELS,
@@ -27,11 +25,16 @@ from patch_sparse_attn import (
     set_run_distill_this_step,
     trainable_sparse_parameters,
 )
+from transformers import (
+    Qwen3VLForConditionalGeneration,
+    Trainer,
+    TrainerCallback,
+    TrainingArguments,
+)
+
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="Train sparse-attention rel-pos bias (16K/head), backbone frozen"
-    )
+    p = argparse.ArgumentParser(description="Train sparse-attention rel-pos bias (16K/head), backbone frozen")
     p.add_argument(
         "--model_path",
         type=str,
@@ -137,13 +140,7 @@ def _format_step_log(metrics: dict) -> str:
         grad = 0.0
     if epoch is None:
         epoch = 0.0
-    return (
-        f"[train] seq_len={metrics.get('seq_len', 'na')} "
-        f"loss={loss:.6f} "
-        f"learning_rate={lr:.6g} "
-        f"epoch={epoch:.4f} "
-        f"grad_norm={grad:.6f}"
-    )
+    return f"[train] seq_len={metrics.get('seq_len', 'na')} " f"loss={loss:.6f} " f"learning_rate={lr:.6g} " f"epoch={epoch:.4f} " f"grad_norm={grad:.6f}"
 
 
 class ConsoleLossCallback(TrainerCallback):
@@ -152,8 +149,7 @@ class ConsoleLossCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, **kwargs):
         if state.is_world_process_zero:
             print(
-                f"[train] start | max_steps={state.max_steps} epochs={args.num_train_epochs} "
-                f"logging_steps={args.logging_steps} grad_accum={args.gradient_accumulation_steps}",
+                f"[train] start | max_steps={state.max_steps} epochs={args.num_train_epochs} " f"logging_steps={args.logging_steps} grad_accum={args.gradient_accumulation_steps}",
                 flush=True,
             )
 
@@ -217,9 +213,7 @@ class SparseAttentionTrainer(Trainer):
             self._last_step_metrics = {"loss_total": log_dict["loss"], "seq_len": length_stats["seq_len"]}
             return (loss, outputs) if return_outputs else loss
 
-        run_distill = (not training) or (
-            self.state.global_step % self.distill_every_n_steps == 0
-        )
+        run_distill = (not training) or (self.state.global_step % self.distill_every_n_steps == 0)
         set_run_distill_this_step(model, run_distill)
 
         forward_inputs = {k: v for k, v in inputs.items() if k != "labels"}
@@ -228,9 +222,7 @@ class SparseAttentionTrainer(Trainer):
         parts = collect_sparse_distill_losses(model)
         mse_raw = parts["mse"]
         if mse_raw is None or not run_distill:
-            raise RuntimeError(
-                "No distill loss on this step; set distill_every_n_steps=1 or enable teacher forward."
-            )
+            raise RuntimeError("No distill loss on this step; set distill_every_n_steps=1 or enable teacher forward.")
         loss = mse_raw
         log_dict: dict[str, float] = {
             "loss_score_mse": float(loss.detach().item()),
@@ -278,10 +270,7 @@ class SparseAttentionTrainer(Trainer):
         seq_len = m.get("seq_len", "na")
 
         print(
-            f"[train] step={step} epoch={epoch:.4f} seq_len={seq_len} "
-            f"loss={_fmt(loss_total)} loss_score_mse={_fmt(mse)} "
-            f"distill={int(distill_on)} "
-            f"lr={float(lr):.6g} grad_norm={float(grad):.6f}",
+            f"[train] step={step} epoch={epoch:.4f} seq_len={seq_len} " f"loss={_fmt(loss_total)} loss_score_mse={_fmt(mse)} " f"distill={int(distill_on)} " f"lr={float(lr):.6g} grad_norm={float(grad):.6f}",
             flush=True,
         )
 
@@ -305,11 +294,7 @@ def main():
     _enable_cuda_speedups()
     args.min_pixels = resolve_min_pixels(args.max_pixels, args.min_pixels)
     mode = "baseline_plain_attention" if args.baseline_plain_attention else "position_only_training"
-    print(
-        f"Run mode={mode} | max_pixels={args.max_pixels} min_pixels={args.min_pixels} "
-        f"train_layer_id={args.train_layer_id} attn={args.attn_implementation} "
-        f"distill_every_n_steps={args.distill_every_n_steps}"
-    )
+    print(f"Run mode={mode} | max_pixels={args.max_pixels} min_pixels={args.min_pixels} " f"train_layer_id={args.train_layer_id} attn={args.attn_implementation} " f"distill_every_n_steps={args.distill_every_n_steps}")
     os.makedirs(args.output_dir, exist_ok=True)
 
     train_hf, eval_hf = load_tomato_split(
@@ -365,14 +350,12 @@ def main():
         heads_per_layer = len(trainable) // max(n_layers, 1)
         n_text_layers = len(_get_language_model(model).layers)
         print(
-            f"Trainable: layer {args.train_layer_id} x {heads_per_layer} heads "
-            f"= {len(trainable)} vectors x {args.rel_pos_buckets} dims, {n_params:,} total",
+            f"Trainable: layer {args.train_layer_id} x {heads_per_layer} heads " f"= {len(trainable)} vectors x {args.rel_pos_buckets} dims, {n_params:,} total",
             flush=True,
         )
         if args.train_layer_id + 1 < n_text_layers:
             print(
-                f"[sparse] early-stop text decoder at layer {args.train_layer_id} "
-                f"(skip layers {args.train_layer_id + 1}-{n_text_layers - 1}, no lm_head)",
+                f"[sparse] early-stop text decoder at layer {args.train_layer_id} " f"(skip layers {args.train_layer_id + 1}-{n_text_layers - 1}, no lm_head)",
                 flush=True,
             )
         if args.rel_pos_init_path:
@@ -382,26 +365,21 @@ def main():
                 expected_layer_id=args.train_layer_id,
             )
             print(
-                f"[init] loaded {n_loaded} head vectors from {args.rel_pos_init_path} "
-                f"(train_layer_id={args.train_layer_id})",
+                f"[init] loaded {n_loaded} head vectors from {args.rel_pos_init_path} " f"(train_layer_id={args.train_layer_id})",
                 flush=True,
             )
         else:
             print(
-                f"[init] default near_tau={args.rel_pos_near_tau} "
-                f"wave_period={args.rel_pos_wave_period} wave_amp={args.rel_pos_wave_amp}",
+                f"[init] default near_tau={args.rel_pos_near_tau} " f"wave_period={args.rel_pos_wave_period} wave_amp={args.rel_pos_wave_amp}",
                 flush=True,
             )
 
     steps_per_epoch = max(
         1,
-        (len(train_dataset) + args.per_device_train_batch_size * args.gradient_accumulation_steps - 1)
-        // (args.per_device_train_batch_size * args.gradient_accumulation_steps),
+        (len(train_dataset) + args.per_device_train_batch_size * args.gradient_accumulation_steps - 1) // (args.per_device_train_batch_size * args.gradient_accumulation_steps),
     )
     print(
-        f"Dataset: train={len(train_dataset)} eval={len(eval_dataset) if eval_dataset else 0} | "
-        f"~{steps_per_epoch} optimizer step(s)/epoch "
-        f"(batch={args.per_device_train_batch_size} grad_accum={args.gradient_accumulation_steps})",
+        f"Dataset: train={len(train_dataset)} eval={len(eval_dataset) if eval_dataset else 0} | " f"~{steps_per_epoch} optimizer step(s)/epoch " f"(batch={args.per_device_train_batch_size} grad_accum={args.gradient_accumulation_steps})",
         flush=True,
     )
 
@@ -460,8 +438,7 @@ def main():
         eval_for_baseline = train_dataset if len(train_dataset) > 0 else eval_dataset
         metrics = trainer.evaluate(eval_dataset=eval_for_baseline)
         print(
-            f"[baseline] loss={metrics.get('eval_loss', float('nan')):.6f} "
-            f"samples={len(eval_for_baseline) if eval_for_baseline is not None else 0}",
+            f"[baseline] loss={metrics.get('eval_loss', float('nan')):.6f} " f"samples={len(eval_for_baseline) if eval_for_baseline is not None else 0}",
             flush=True,
         )
         return

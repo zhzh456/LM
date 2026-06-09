@@ -201,9 +201,7 @@ def _prepare_additive_attention_mask(
         q_ok = real.view(batch_size, 1, q_len, 1)
         k_ok = real.view(batch_size, 1, 1, kv_len)
         visible = q_ok & k_ok
-        visible = visible & _lower_triangular_pair_mask(
-            batch_size, n_heads, q_len, kv_len, device
-        )
+        visible = visible & _lower_triangular_pair_mask(batch_size, n_heads, q_len, kv_len, device)
         blocked = torch.finfo(dtype).min
         return torch.where(
             visible,
@@ -293,9 +291,7 @@ def _sparse_pre_softmax_scores(
     from transformers.models.qwen3_vl.modeling_qwen3_vl import repeat_kv
 
     n_heads = rel_pos_bias.size(0)
-    pos = build_relative_position_bias(rel_pos_bias, q_len, kv_len).to(
-        device=query.device, dtype=dtype
-    )
+    pos = build_relative_position_bias(rel_pos_bias, q_len, kv_len).to(device=query.device, dtype=dtype)
     if batch_size > 1:
         pos = pos.expand(batch_size, -1, -1, -1).contiguous()
 

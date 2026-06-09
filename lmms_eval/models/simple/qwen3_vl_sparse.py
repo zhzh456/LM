@@ -44,10 +44,7 @@ class Qwen3_VL_Sparse(Qwen3_VL):
         **kwargs,
     ) -> None:
         if not sparse_rel_pos_path:
-            raise ValueError(
-                "qwen3_vl_sparse requires sparse_rel_pos_path "
-                "(e.g. /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias.pt)"
-            )
+            raise ValueError("qwen3_vl_sparse requires sparse_rel_pos_path " "(e.g. /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias.pt)")
         if kwargs:
             raise ValueError(f"Unexpected kwargs for qwen3_vl_sparse: {kwargs}")
 
