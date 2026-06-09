@@ -46,7 +46,12 @@ def parse_args():
     )
     p.add_argument("--dataset", type=str, default="lmms-lab/TOMATO")
     p.add_argument("--limit", type=int, default=None)
-    p.add_argument("--train_ratio", type=float, default=0.9)
+    p.add_argument(
+        "--train_ratio",
+        type=float,
+        default=1.0,
+        help="Fraction of data for training; 1.0 = all data, no eval. Use e.g. 0.9 to hold out 10%% for Trainer eval.",
+    )
     p.add_argument("--num_frames", type=int, default=16)
     p.add_argument("--max_pixels", type=int, default=DEFAULT_MAX_PIXELS)
     p.add_argument("--min_pixels", type=int, default=None)
@@ -69,7 +74,7 @@ def parse_args():
     p.add_argument(
         "--train_layer_id",
         type=int,
-        default=0,
+        default=35,
         help="Text decoder layer index to train sparse rel-pos on (0-based)",
     )
     p.add_argument(

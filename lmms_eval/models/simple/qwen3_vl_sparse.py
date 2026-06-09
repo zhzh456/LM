@@ -23,7 +23,7 @@ class Qwen3_VL_Sparse(Qwen3_VL):
         pretrained: str = "Qwen/Qwen3-VL-4B-Instruct",
         sparse_rel_pos_path: str = "",
         rel_pos_buckets: int = 16384,
-        sparse_layer_id: int = 0,
+        sparse_layer_id: int = 35,
         device: Optional[str] = "cuda",
         device_map: Optional[str] = "auto",
         batch_size: Optional[Union[int, str]] = 1,

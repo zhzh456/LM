@@ -88,11 +88,13 @@ def load_tomato_split(
     ds = load_dataset(dataset_name, split=split, token=True)
     if limit is not None:
         ds = ds.select(range(min(limit, len(ds))))
-    if train_ratio is None:
+    if train_ratio is None or train_ratio >= 1.0:
         return ds, None
     ds = ds.shuffle(seed=seed)
-    n_train = int(len(ds) * train_ratio)
-    return ds.select(range(n_train)), ds.select(range(n_train, len(ds)))
+    n_train = min(int(len(ds) * train_ratio), len(ds))
+    train_ds = ds.select(range(n_train))
+    eval_ds = ds.select(range(n_train, len(ds))) if n_train < len(ds) else None
+    return train_ds, eval_ds
 
 
 class TomatoSFTDataset:

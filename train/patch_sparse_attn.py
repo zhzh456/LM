@@ -96,7 +96,7 @@ def freeze_backbone(model: nn.Module) -> None:
 def attach_sparse_attention_modules(
     model: nn.Module,
     *,
-    layer_id: int = 0,
+    layer_id: int = 35,
     num_buckets: int = 16384,
     near_tau: float = 128.0,
     wave_period: float = 32.0,
@@ -332,7 +332,7 @@ def _patch_attention_forward(attn: nn.Module) -> None:
 def patch_model_for_sparse_training(
     model: nn.Module,
     *,
-    layer_id: int = 0,
+    layer_id: int = 35,
     **attach_kwargs,
 ) -> List[nn.Parameter]:
     """Freeze backbone; train sparse rel-pos on one text layer only."""
@@ -351,7 +351,7 @@ def patch_model_for_sparse_training(
 def patch_model_for_sparse_eval(
     model: nn.Module,
     *,
-    layer_id: int = 0,
+    layer_id: int = 35,
     **attach_kwargs,
 ) -> None:
     """Eval-only: one layer uses sparse pre-RoPE attention; others keep default."""

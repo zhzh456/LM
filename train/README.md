@@ -2,7 +2,7 @@
 
 在 **TOMATO** 上训练 **稀疏注意力** 模块（**冻结** Qwen3-VL 全部 backbone 权重）：
 
-- **指定一层**（`--train_layer_id`，默认 0）、**每个 attention head** 各有一组可训练参数，默认形状 **`(16384,)`**（16K，`--rel_pos_buckets`）
+- **指定一层**（`--train_layer_id`，默认 35）、**每个 attention head** 各有一组可训练参数，默认形状 **`(16384,)`**（16K，`--rel_pos_buckets`）
   - 第 `d` 维 = 距离 \(d\) 上的可训练系数 \(f(d)\)；student pre-softmax = **`f(d) × Q_pre·K_pre / √d + mask`**（RoPE **之前**的 Q/K），teacher = **`RoPE(Q)·RoPE(K) / √d + mask`**
   - 初始化：近距离偏大 `exp(-d/τ)` + 随距离衰减的正弦震荡（每 head 相位不同）；也可用 `baseline_relpos_scores.pt`（从全量 attention dump 按距离打包）
   - `d=0`：同位置；`d=1`：相距 1；…（不是每层共用一个参数）
@@ -34,7 +34,7 @@ export HTTPS_PROXY=http://10.229.18.27:8412
 python -c "from datasets import load_dataset; load_dataset('lmms-lab/TOMATO', split='test', token=True)"
 ```
 
-TOMATO 仅有 `test` split；训练脚本默认用其中 90% 做训练、10% 做验证。
+TOMATO 仅有 `test` split；训练脚本默认全量用于训练（`train_ratio=1.0`，不做 Trainer eval）。
 
 ## 训练
 
@@ -85,9 +85,9 @@ bash examples/models/qwen3vl_sparse_attn.sh
 | `--model_path` | 本地 4B 路径 | 同 `pretrained=` |
 | `--max_pixels` | 12845056（`run_train.sh`） | 同 `model_args` 的 `max_pixels` |
 | `--rel_pos_buckets` | 16384 | 每 head 距离系数长度 |
-| `--learning_rate` | 1（`run_train.sh`） | 仅 rel-pos 可训练；建议扫多组对比 |
+| `--learning_rate` | 0.1（`run_train.sh`） | 仅 rel-pos 可训练；建议扫多组对比 |
 | `--num_frames` | 16（`run_train.sh`） | 同 `max_num_frames`；`min_pixels` 自动为 3136 |
-| `--train_ratio` | 0.9 | test 集划分训练/验证 |
+| `--train_ratio` | 1.0 | 全量训练；如 0.9 则留 10% 做 Trainer eval |
 | `--rel_pos_init_path` | 无 | 可选：从 `.pt` 加载 `layer_{i}.head_{h}` 初始化 rel-pos（训练内不做统计） |
 
 ## Todo
@@ -138,4 +138,4 @@ bash examples/models/qwen3vl_sparse_attn.sh
 
 3. 多模态评测：**prefill 用稀疏 pre-softmax**，**decode 用全量 RoPE QK**。
 
-4. 先在 layer 0 上把训练方式定下来（公式、init、lr、prefill/decode 分工与评测采集），再按同样流程训练其他层。
+4. 先在 layer 35 上把训练方式定下来（公式、init、lr、prefill/decode 分工与评测采集），再按同样流程训练其他层。

@@ -18,6 +18,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--task", default="mmbench_en_dev", choices=["mmbench_en_dev", "tomato"])
     p.add_argument("--model_path", default="/home/zhanghao360/model/Qwen3-VL-4B-Instruct")
+    p.add_argument("--sparse-layer-id", type=int, default=35)
     args = p.parse_args()
 
     from datasets import load_dataset
@@ -59,7 +60,7 @@ def main():
     enc = {k: v.to("cuda:0") if hasattr(v, "to") else v for k, v in enc.items()}
 
     stats = {"prefill": 0, "decode": 0, "other": 0}
-    layer0_q_lens: list[int] = []
+    sparse_q_lens: list[int] = []
 
     for attn in _iter_text_attention_modules(model):
         orig = attn.forward
@@ -76,8 +77,8 @@ def main():
                 key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
             q_len = int(query_states.size(-2))
             kv_len = int(key_states.size(-2))
-            if self.layer_idx == 0:
-                layer0_q_lens.append(q_len)
+            if self.layer_idx == args.sparse_layer_id:
+                sparse_q_lens.append(q_len)
             if q_len > 1:
                 stats["prefill"] += 1
             elif q_len == 1:
@@ -99,7 +100,11 @@ def main():
     trimmed = out[0, enc["input_ids"].shape[1] :]
     text_out = processor.decode(trimmed, skip_special_tokens=True)
     print(f"new_tokens={new_tokens} output={text_out!r}", flush=True)
-    print(f"layer0 unique q_lens during generate: {sorted(set(layer0_q_lens))}", flush=True)
+    print(
+        f"layer {args.sparse_layer_id} unique q_lens during generate: "
+        f"{sorted(set(sparse_q_lens))}",
+        flush=True,
+    )
     print(f"per-layer forward counts (q>1 prefill, q==1 decode): prefill={stats['prefill']} decode={stats['decode']}", flush=True)
     n_layers = len(list(_iter_text_attention_modules(model)))
     print(f"expected prefill forwards (once): {n_layers}, decode forwards: {n_layers * max(new_tokens, 0)}", flush=True)

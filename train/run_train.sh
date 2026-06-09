@@ -19,7 +19,7 @@ if [[ -n "${RESUME_FROM_CHECKPOINT:-}" && -d "${RESUME_FROM_CHECKPOINT}" ]]; the
 fi
 
 # max_pixels=12845056 (video clips to 786432/frame, seq~6K). Distill uses scores-only path.
-# rel_pos: default prior init (exp decay + wave); lr=1, 1 epoch.
+# rel_pos: default prior init (exp decay + wave); lr=0.1, 0.25 epoch.
 # checkpoint every 0.25 epoch -> checkpoint-{step}/sparse_rel_pos_bias.pt
 accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   --model_path /home/zhanghao360/model/Qwen3-VL-4B-Instruct \
@@ -30,11 +30,11 @@ accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   --rel_pos_buckets 16384 \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 1 \
-  --num_train_epochs 1 \
-  --train_layer_id 0 \
+  --num_train_epochs 0.25 \
+  --train_layer_id 35 \
   --attn_implementation flash_attention_2 \
-  --learning_rate 1 \
-  --warmup_ratio 0.03 \
+  --learning_rate 0.1 \
+  --warmup_ratio 0.12 \
   --logging_steps 1 \
   --bf16 \
   --distill_every_n_steps 1 \
@@ -45,3 +45,6 @@ accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   "$@"
 
 # bash train/run_train.sh --rel_pos_init_path /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias.pt
+# layer0 backup: /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias_layer0.pt
+# layer18 backup: /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias_layer18.pt
+# layer35 backup: /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias_layer35.pt

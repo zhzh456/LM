@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Single-sample compare: prefill last-token pre-softmax scores (layer 0 only).
+Single-sample compare: prefill last-token pre-softmax scores (sparse layer only).
 
 - GT (baseline): RoPE(Q)·RoPE(K)/sqrt(d)
 - Predicted (sparse): f(d)·Q_pre·K_pre/sqrt(d)
@@ -99,7 +99,7 @@ def capture_prefill_last_token_scores(
     model: torch.nn.Module,
     inputs: dict,
     *,
-    layer_id: int = 0,
+    layer_id: int = 35,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Return baseline/sparse last-query rows (num_heads, kv_len) and seq_len."""
     captured: dict[str, torch.Tensor] = {}
@@ -312,10 +312,10 @@ def main():
         "--sparse_weights",
         default="/tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias.pt",
     )
-    p.add_argument("--out-dir", default="/tmp/Figure/prefill_last_token_layer0")
+    p.add_argument("--out-dir", default="/tmp/Figure/prefill_last_token_layer35")
     p.add_argument("--sample-index", type=int, default=None, help="Single sample (overrides --num-samples)")
     p.add_argument("--num-samples", type=int, default=2, help="Plot samples 0..num_samples-1")
-    p.add_argument("--layer-id", type=int, default=0)
+    p.add_argument("--layer-id", type=int, default=35)
     p.add_argument("--max_pixels", type=int, default=12845056)
     p.add_argument("--num_frames", type=int, default=16)
     args = p.parse_args()
