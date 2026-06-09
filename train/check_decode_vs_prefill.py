@@ -111,8 +111,7 @@ def main():
     text_out = processor.decode(trimmed, skip_special_tokens=True)
     print(f"new_tokens={new_tokens} output={text_out!r}", flush=True)
     print(
-        f"layer {args.sparse_layer_id} unique q_lens during generate: "
-        f"{sorted(set(sparse_q_lens))}",
+        f"layer {args.sparse_layer_id} unique q_lens during generate: " f"{sorted(set(sparse_q_lens))}",
         flush=True,
     )
     print(f"per-layer forward counts (q>1 prefill, q==1 decode): prefill={stats['prefill']} decode={stats['decode']}", flush=True)

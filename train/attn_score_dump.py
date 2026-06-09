@@ -91,9 +91,7 @@ def record_pre_softmax_scores(attn_module: nn.Module, scores: torch.Tensor) -> N
 
     if q_len != 1:
         return
-    if root is not None and (
-        getattr(attn_module, "use_sparse_attention", False) or layer_idx == 0
-    ):
+    if root is not None and (getattr(attn_module, "use_sparse_attention", False) or layer_idx == 0):
         root._attn_dump_decode_fwd = getattr(root, "_attn_dump_decode_fwd", 0) + 1
     fwd = getattr(root, "_attn_dump_decode_fwd", 1) if root is not None else 1
     if fwd != 1:
