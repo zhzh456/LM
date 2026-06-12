@@ -6,10 +6,10 @@ import argparse
 import gc
 
 import torch
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-
 from dataset import TomatoSFTDataset, load_tomato_split
 from patch_sparse_attn import patch_model_for_sparse_training, set_run_distill_this_step
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
 from train import Qwen3VLDataCollator
 
 
@@ -53,9 +53,7 @@ def main() -> None:
         captured["n_heads"] = n_heads
         shape = (1, n_heads, q_len, kv_len)
         print(
-            f"[probe] layer0 hidden seq={q_len} heads={n_heads} "
-            f"attn map {shape} bf16={_tensor_gb(shape, torch.bfloat16):.2f}GiB "
-            f"fp32={_tensor_gb(shape, torch.float32):.2f}GiB",
+            f"[probe] layer0 hidden seq={q_len} heads={n_heads} " f"attn map {shape} bf16={_tensor_gb(shape, torch.bfloat16):.2f}GiB " f"fp32={_tensor_gb(shape, torch.float32):.2f}GiB",
             flush=True,
         )
 

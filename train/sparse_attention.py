@@ -514,7 +514,7 @@ class _ChunkedMaskedKL(torch.autograd.Function):
                     continue
                 kl_per_query = _kl_per_query_rows(full_p, sparse_q, valid_rows, eps=eps, dtype=kl_dtype)
                 chunk_loss = kl_per_query.sum() / n_rows
-                g, = torch.autograd.grad(chunk_loss, s_leaf, retain_graph=False)
+                (g,) = torch.autograd.grad(chunk_loss, s_leaf, retain_graph=False)
             grad_scores[..., q0:q1, :] = g
         return grad_output * grad_scores, None, None, None, None, None
 
