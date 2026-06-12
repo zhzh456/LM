@@ -64,7 +64,7 @@ def main() -> None:
         trust_remote_code=True,
     )
     processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
-    patch_model_for_sparse_training(model, layer_id=0, sparse_kl_weight=0.1, sparse_dist_score_scale=0.1)
+    patch_model_for_sparse_training(model, layer_id=0, sparse_dist_score_scale=0.1)
 
     from patch_sparse_attn import _iter_text_attention_modules
 

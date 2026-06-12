@@ -437,6 +437,7 @@ def attention_distance_gap_recall_loss(
     attention_mask: torch.Tensor | None,
     target_topk_k: int,
     *,
+    content_topk_k: int = DEFAULT_CONTENT_TOPK_K,
     query_chunk_size: int = 64,
     max_query_rows: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -444,6 +445,7 @@ def attention_distance_gap_recall_loss(
     Train S[d] on baseline top-k keys that content did NOT select.
 
     gap = teacher_topk \\ content; recall_gap = |gap ∩ mask_d| / |gap|.
+    Tail query rows only (early rows have too few keys for a non-empty gap).
     Returns (loss, gap_recall, union_recall) scalars.
     """
     bsz, n_heads, q_len, kv_len = teacher_scores.shape
@@ -467,11 +469,13 @@ def attention_distance_gap_recall_loss(
 
     mask_c_hard = mask_c.detach() > 0.5
     union_soft = torch.maximum(mask_c.detach(), mask_d)
-    q_limit = min(q_len, max(1, int(max_query_rows)))
+    n_rows = min(q_len, max(1, int(max_query_rows)))
+    # Early queries have <content_topk_k keys → content covers all keys, gap is empty.
+    q_start = max(0, q_len - n_rows)
     chunk = max(1, int(query_chunk_size))
 
-    for q0 in range(0, q_limit, chunk):
-        q1 = min(q0 + chunk, q_limit)
+    for q0 in range(q_start, q_len, chunk):
+        q1 = min(q0 + chunk, q_len)
         valid_chunk = valid[:, :, q0:q1, :]
         if not valid_chunk.any():
             continue
@@ -486,10 +490,13 @@ def attention_distance_gap_recall_loss(
         md = mask_d[:, :, q0:q1, :]
         un = union_soft[:, :, q0:q1, :] > 0.5
 
+        n_valid = valid_chunk.float().sum(dim=-1)
+        enough_keys = n_valid > float(max(int(content_topk_k), k))
+
         gap = full_topk & ~mc
         gap_cnt = gap.float().sum(dim=-1)
         hit = (gap.float() * md).sum(dim=-1)
-        gap_rows = gap_cnt > 0.5
+        gap_rows = (gap_cnt > 0.5) & enough_keys
         if gap_rows.any():
             row_recall = (hit / gap_cnt.clamp(min=1.0)).masked_select(gap_rows)
             gap_recall_sum = gap_recall_sum + row_recall.sum()
@@ -497,9 +504,10 @@ def attention_distance_gap_recall_loss(
             n_gap_rows = n_gap_rows + gap_rows.float().sum()
 
         union_hit = (full_topk.float() * un.float()).sum(dim=-1)
-        valid_rows = valid_chunk.any(dim=-1)
+        k_eff = torch.minimum(n_valid, torch.full_like(n_valid, float(k))).clamp(min=1.0)
+        valid_rows = enough_keys
         if valid_rows.any():
-            ur = (union_hit / float(k)).masked_select(valid_rows)
+            ur = (union_hit / k_eff).masked_select(valid_rows)
             union_recall_sum = union_recall_sum + ur.sum()
             n_union_rows = n_union_rows + valid_rows.float().sum()
 

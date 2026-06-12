@@ -77,8 +77,7 @@ def parse_args():
         help="Content-branch top-k per query (pre-RoPE Q·K, hard detach).",
     )
     p.add_argument("--ste_tau", type=float, default=0.25, help="STE softmax temperature for distance top-k.")
-    p.add_argument("--sparse_kl_weight", type=float, default=1.0)
-    p.add_argument("--sparse_gap_recall_weight", type=float, default=0.5)
+    p.add_argument("--sparse_gap_recall_weight", type=float, default=1.0)
     p.add_argument(
         "--sparse_dist_score_scale",
         type=float,
@@ -250,8 +249,6 @@ class SparseAttentionTrainer(Trainer):
         log_dict: dict[str, float] = {
             "loss": float(loss.detach().item()),
         }
-        if parts.get("kl") is not None:
-            log_dict["loss_kl"] = float(parts["kl"].detach().item())
         if parts.get("gap") is not None:
             log_dict["loss_gap"] = float(parts["gap"].detach().item())
         if parts.get("gap_recall") is not None:
@@ -261,7 +258,6 @@ class SparseAttentionTrainer(Trainer):
         log_dict["distill_active"] = int(run_distill)
         self._last_step_metrics = {
             "loss_total": log_dict["loss"],
-            "loss_kl": log_dict.get("loss_kl"),
             "loss_gap": log_dict.get("loss_gap"),
             "gap_recall": log_dict.get("gap_recall"),
             "union_recall": log_dict.get("union_recall"),
@@ -308,7 +304,6 @@ class SparseAttentionTrainer(Trainer):
         def _fmt(v: float) -> str:
             return "nan" if v != v else f"{v:.6f}"
 
-        loss_kl = m.get("loss_kl")
         loss_gap = m.get("loss_gap")
         gap_recall = m.get("gap_recall")
         union_recall = m.get("union_recall")
@@ -316,8 +311,6 @@ class SparseAttentionTrainer(Trainer):
         seq_len = m.get("seq_len", "na")
 
         extra = ""
-        if loss_kl is not None:
-            extra += f" loss_kl={_fmt(float(loss_kl))}"
         if loss_gap is not None:
             extra += f" loss_gap={_fmt(float(loss_gap))}"
         if gap_recall is not None:
@@ -402,7 +395,6 @@ def main():
             content_topk_k=args.content_topk_k,
             target_topk_k=args.sparse_topk_k,
             ste_tau=args.ste_tau,
-            sparse_kl_weight=args.sparse_kl_weight,
             sparse_gap_recall_weight=args.sparse_gap_recall_weight,
             sparse_dist_score_scale=args.sparse_dist_score_scale,
         )

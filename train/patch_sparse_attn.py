@@ -16,7 +16,6 @@ from sparse_attention import (
     DEFAULT_SPARSE_TOPK_K,
     DEFAULT_STE_TAU,
     PerHeadRelativePositionBias,
-    attention_distillation_loss,
     attention_distance_gap_recall_loss,
     dense_eager_attention_forward,
     full_qk_eager_attention_forward,
@@ -112,8 +111,7 @@ def attach_sparse_attention_modules(
     content_topk_k: int = DEFAULT_CONTENT_TOPK_K,
     target_topk_k: int | None = None,
     ste_tau: float = DEFAULT_STE_TAU,
-    sparse_kl_weight: float = 1.0,
-    sparse_gap_recall_weight: float = 0.5,
+    sparse_gap_recall_weight: float = 1.0,
     sparse_dist_score_scale: float = 0.75,
     distance_ste_local: bool = True,
 ) -> List[nn.Parameter]:
@@ -140,7 +138,6 @@ def attach_sparse_attention_modules(
         attn.sparse_distance_topk_k = int(sparse_topk_k)
         attn.sparse_target_topk_k = int(target_topk_k if target_topk_k is not None else sparse_topk_k)
         attn.sparse_ste_tau = float(ste_tau)
-        attn.sparse_kl_weight = float(sparse_kl_weight)
         attn.sparse_gap_recall_weight = float(sparse_gap_recall_weight)
         attn.sparse_dist_score_scale = float(sparse_dist_score_scale)
         attn.sparse_distance_ste_local = bool(distance_ste_local)
@@ -397,7 +394,7 @@ def patch_model_for_sparse_eval(
 
 
 def finalize_sparse_distill_losses(model: nn.Module) -> None:
-    """Compute KL + gap-recall after full forward (keeps peak memory out of layer forward)."""
+    """Compute gap-recall loss after full forward (keeps peak memory out of layer forward)."""
     for attn in _iter_text_attention_modules(model):
         if not getattr(attn, "use_sparse_attention", False):
             continue
@@ -405,31 +402,21 @@ def finalize_sparse_distill_losses(model: nn.Module) -> None:
         if extras is None:
             continue
         attention_mask = getattr(attn, "_sparse_distill_attention_mask", None)
-        union_mask = extras.get("union_mask")
-        support = (union_mask > 0.5) if union_mask is not None else None
-        kl_loss = attention_distillation_loss(
-            sparse_scores=extras["sparse_scores"],
-            teacher_scores=extras["teacher_scores"],
-            attention_mask=attention_mask,
-            support_mask=support,
-        )
-        gap_loss = gap_recall = union_recall = None
         mask_c = extras.get("mask_c")
         mask_d = extras.get("mask_d")
-        if mask_c is not None and mask_d is not None:
-            gap_loss, gap_recall, union_recall = attention_distance_gap_recall_loss(
-                extras["teacher_scores"],
-                mask_d,
-                mask_c,
-                attention_mask,
-                int(getattr(attn, "sparse_target_topk_k", DEFAULT_SPARSE_TOPK_K)),
-            )
-        kl_w = float(getattr(attn, "sparse_kl_weight", 1.0))
-        gap_w = float(getattr(attn, "sparse_gap_recall_weight", 0.5))
-        distill_loss = kl_w * kl_loss
-        if gap_loss is not None:
-            distill_loss = distill_loss + gap_w * gap_loss
-        attn._sparse_kl_loss = kl_loss
+        if mask_c is None or mask_d is None:
+            raise RuntimeError("gap-recall distill requires mask_c and mask_d from sparse forward")
+        gap_loss, gap_recall, union_recall = attention_distance_gap_recall_loss(
+            extras["teacher_scores"],
+            mask_d,
+            mask_c,
+            attention_mask,
+            int(getattr(attn, "sparse_target_topk_k", DEFAULT_SPARSE_TOPK_K)),
+            content_topk_k=int(getattr(attn, "sparse_content_topk_k", DEFAULT_CONTENT_TOPK_K)),
+        )
+        gap_w = float(getattr(attn, "sparse_gap_recall_weight", 1.0))
+        distill_loss = gap_w * gap_loss
+        attn._sparse_kl_loss = None
         attn._sparse_gap_recall_loss = gap_loss
         attn._sparse_gap_recall = gap_recall
         attn._sparse_topk_recall = union_recall

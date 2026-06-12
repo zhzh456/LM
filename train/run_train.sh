@@ -20,7 +20,7 @@ if [[ -n "${RESUME_FROM_CHECKPOINT:-}" && -d "${RESUME_FROM_CHECKPOINT}" ]]; the
   RESUME_ARGS=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
 
-# Union sparse: content top-500 ∪ distance top-1000 (STE) → RoPE sparse attn; KL + gap-recall.
+# Union sparse: content top-500 ∪ distance top-1000 (STE) → RoPE sparse attn; gap-recall loss only.
 accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   --model_path /home/zhanghao360/model/Qwen3-VL-4B-Instruct \
   --output_dir /tmp/qwen3vl-sparse-attn \
@@ -31,12 +31,11 @@ accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   --content_topk_k 500 \
   --sparse_topk_k 1000 \
   --ste_tau 0.25 \
-  --sparse_kl_weight 1.0 \
-  --sparse_gap_recall_weight 0.5 \
+  --sparse_gap_recall_weight 1.0 \
   --sparse_dist_score_scale 0.75 \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 1 \
-  --num_train_epochs 0.25 \
+  --num_train_epochs 1 \
   --train_layer_id 0 \
   --attn_implementation flash_attention_2 \
   --learning_rate 3e-3 \
