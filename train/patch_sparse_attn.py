@@ -272,23 +272,25 @@ def _patch_attention_forward(attn: nn.Module) -> None:
                     return_distill_tensors=True,
                 )
             if run_distill:
-                sparse_scores = distill["attn_scores"]
                 with torch.no_grad():
-                    full_scores = qk_pre_softmax_scores(
+                    teacher_scores = qk_pre_softmax_scores(
                         self,
                         query_states,
                         key_states,
                         attention_mask,
                         self.scaling,
                     )
-                loss_out = attention_scores_distillation_loss(full_scores, sparse_scores, attention_mask)
-                self._sparse_kl_loss = None
-                self._sparse_mse_loss = loss_out
-                self._sparse_distill_loss = loss_out
+                self._sparse_distill_extras = {
+                    "sparse_scores": distill["attn_scores"],
+                    "teacher_scores": teacher_scores,
+                }
+                self._sparse_distill_attention_mask = attention_mask
             else:
-                self._sparse_kl_loss = None
-                self._sparse_mse_loss = None
-                self._sparse_distill_loss = None
+                self._sparse_distill_extras = None
+                self._sparse_distill_attention_mask = None
+            self._sparse_kl_loss = None
+            self._sparse_mse_loss = None
+            self._sparse_distill_loss = None
             attn_output = sparse_out
         else:
             # Eval: prefill = sparse pre-softmax f(d)*Q_pre*K_pre/sqrt(d); decode = full RoPE QK.
@@ -361,6 +363,26 @@ def patch_model_for_sparse_eval(
         _patch_attention_forward(attn)
     reset_sparse_pre_rope_key_caches(model)
     _wrap_generate_reset_pre_rope_cache(model)
+
+
+def finalize_sparse_distill_losses(model: nn.Module) -> None:
+    """Compute score MSE after full forward (keeps peak memory out of nested layer forward)."""
+    for attn in _iter_text_attention_modules(model):
+        if not getattr(attn, "use_sparse_attention", False):
+            continue
+        extras = getattr(attn, "_sparse_distill_extras", None)
+        if extras is None:
+            continue
+        loss_out = attention_scores_distillation_loss(
+            extras["teacher_scores"],
+            extras["sparse_scores"],
+            getattr(attn, "_sparse_distill_attention_mask", None),
+        )
+        attn._sparse_kl_loss = None
+        attn._sparse_mse_loss = loss_out
+        attn._sparse_distill_loss = loss_out
+        attn._sparse_distill_extras = None
+        attn._sparse_distill_attention_mask = None
 
 
 def collect_sparse_distill_loss(model: nn.Module) -> torch.Tensor | None:

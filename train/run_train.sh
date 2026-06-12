@@ -7,6 +7,8 @@ export HTTP_PROXY=http://10.229.18.27:8412
 export HTTPS_PROXY=http://10.229.18.27:8412
 # Reduce CUDA allocator fragmentation (helps large contiguous backward allocs).
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export NUMEXPR_MAX_THREADS="${NUMEXPR_MAX_THREADS:-64}"
 
 cd "$(dirname "$0")"
 export PYTHONPATH="$(cd .. && pwd):${PYTHONPATH:-}"
@@ -31,7 +33,7 @@ accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 1 \
   --num_train_epochs 0.25 \
-  --train_layer_id 35 \
+  --train_layer_id 0 \
   --attn_implementation flash_attention_2 \
   --learning_rate 0.1 \
   --warmup_ratio 0.12 \

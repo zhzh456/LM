@@ -358,8 +358,8 @@ def sparse_eager_attention_forward(
         dtype=query.dtype,
     )
 
-    full_weights = F.softmax(attn_scores.float(), dim=-1).to(query.dtype)
-    attn_weights = F.dropout(full_weights, p=dropout, training=module.training)
+    attn_weights = F.softmax(attn_scores, dim=-1)
+    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
 
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
@@ -409,29 +409,168 @@ def sparse_scores_only_forward(
     return dummy, None, {"attn_scores": attn_scores}
 
 
-def attention_distillation_loss(
-    full_weights: torch.Tensor,
-    sparse_weights: torch.Tensor,
+def _loss_dtype(ref: torch.Tensor) -> torch.dtype:
+    """Keep distill math in 16-bit when activations are bf16/fp16."""
+    if ref.dtype in (torch.bfloat16, torch.float16):
+        return ref.dtype
+    return torch.bfloat16
+
+
+def _zero_loss_anchor(t: torch.Tensor) -> torch.Tensor:
+    """Scalar 0 tied to ``t`` for autograd; safe when ``t`` has -inf masked slots."""
+    return (t.nan_to_num(0.0) * 0.0).sum()
+
+
+def _kl_per_query_rows(
+    full_p: torch.Tensor,
+    sparse_q: torch.Tensor,
+    valid_rows: torch.Tensor,
     *,
-    prior_key_only: bool = True,
+    eps: float,
+    dtype: torch.dtype,
 ) -> torch.Tensor:
-    """KL(full || sparse) on keys j < p for each query position p."""
+    fp = full_p.to(dtype).clamp(min=eps)
+    sq = sparse_q.to(dtype).clamp(min=eps)
+    kl = (fp * (fp.log() - sq.log())).sum(dim=-1)
+    return kl.masked_fill(~valid_rows, 0.0)
+
+
+class _ChunkedMaskedKL(torch.autograd.Function):
+    """KL(full||sparse) with per-query-chunk backward (bf16 softmax, bounded peak memory)."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        sparse_scores: torch.Tensor,
+        teacher_scores: torch.Tensor,
+        valid: torch.Tensor,
+        support_mask: torch.Tensor | None,
+        query_chunk_size: int,
+        kl_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        neg_inf = torch.tensor(-1e4, device=sparse_scores.device, dtype=kl_dtype)
+        eps = 1e-7 if kl_dtype == torch.bfloat16 else 1e-10
+        kl_sum = sparse_scores.new_zeros((), dtype=kl_dtype)
+        n_rows = sparse_scores.new_zeros((), dtype=kl_dtype)
+        chunk = max(1, int(query_chunk_size))
+        q_len = sparse_scores.size(2)
+        with torch.no_grad():
+            for q0 in range(0, q_len, chunk):
+                q1 = min(q0 + chunk, q_len)
+                valid_chunk = valid[..., q0:q1, :]
+                if support_mask is not None:
+                    valid_chunk = valid_chunk & support_mask[..., q0:q1, :].bool()
+                if not valid_chunk.any():
+                    continue
+                sparse_logits = sparse_scores[..., q0:q1, :].to(dtype=kl_dtype).masked_fill(~valid_chunk, neg_inf)
+                sparse_q = F.softmax(sparse_logits, dim=-1)
+                teacher_logits = teacher_scores[..., q0:q1, :].to(dtype=kl_dtype).masked_fill(~valid_chunk, neg_inf)
+                full_p = F.softmax(teacher_logits, dim=-1)
+                valid_rows = valid_chunk.any(dim=-1)
+                if not valid_rows.any():
+                    continue
+                kl_per_query = _kl_per_query_rows(full_p, sparse_q, valid_rows, eps=eps, dtype=kl_dtype)
+                kl_sum = kl_sum + kl_per_query.sum()
+                n_rows = n_rows + valid_rows.to(dtype=kl_dtype).sum()
+        if n_rows.item() < 0.5:
+            ctx.skip_backward = True
+            return _zero_loss_anchor(sparse_scores)
+        ctx.skip_backward = False
+        ctx.query_chunk_size = chunk
+        ctx.n_rows = n_rows.clamp(min=1.0)
+        ctx.kl_dtype = kl_dtype
+        ctx.eps = eps
+        ctx.save_for_backward(sparse_scores, teacher_scores, valid, support_mask)
+        return kl_sum / ctx.n_rows + _zero_loss_anchor(sparse_scores)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if getattr(ctx, "skip_backward", False):
+            return None, None, None, None, None, None
+        sparse_scores, teacher_scores, valid, support_mask = ctx.saved_tensors
+        grad_scores = torch.zeros_like(sparse_scores)
+        chunk = ctx.query_chunk_size
+        kl_dtype = ctx.kl_dtype
+        n_rows = ctx.n_rows
+        neg_inf = torch.tensor(-1e4, device=sparse_scores.device, dtype=kl_dtype)
+        eps = ctx.eps
+        q_len = sparse_scores.size(2)
+        for q0 in range(0, q_len, chunk):
+            q1 = min(q0 + chunk, q_len)
+            valid_chunk = valid[..., q0:q1, :]
+            if support_mask is not None:
+                valid_chunk = valid_chunk & support_mask[..., q0:q1, :].bool()
+            if not valid_chunk.any():
+                continue
+            s_leaf = sparse_scores[..., q0:q1, :].detach().requires_grad_(True)
+            with torch.enable_grad():
+                sparse_logits = s_leaf.to(dtype=kl_dtype).masked_fill(~valid_chunk, neg_inf)
+                sparse_q = F.softmax(sparse_logits, dim=-1)
+                with torch.no_grad():
+                    teacher_logits = teacher_scores[..., q0:q1, :].to(dtype=kl_dtype).masked_fill(~valid_chunk, neg_inf)
+                    full_p = F.softmax(teacher_logits, dim=-1)
+                valid_rows = valid_chunk.any(dim=-1)
+                if not valid_rows.any():
+                    continue
+                kl_per_query = _kl_per_query_rows(full_p, sparse_q, valid_rows, eps=eps, dtype=kl_dtype)
+                chunk_loss = kl_per_query.sum() / n_rows
+                g, = torch.autograd.grad(chunk_loss, s_leaf, retain_graph=False)
+            grad_scores[..., q0:q1, :] = g
+        return grad_output * grad_scores, None, None, None, None, None
+
+
+def attention_distillation_loss(
+    full_weights: torch.Tensor | None = None,
+    sparse_weights: torch.Tensor | None = None,
+    *,
+    sparse_scores: torch.Tensor | None = None,
+    teacher_scores: torch.Tensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+    support_mask: torch.Tensor | None = None,
+    prior_key_only: bool = True,
+    query_chunk_size: int = 32,
+) -> torch.Tensor:
+    """KL(full||sparse); chunked backward when ``sparse_scores`` + ``teacher_scores`` are given."""
+    if sparse_scores is not None and teacher_scores is not None:
+        ref = sparse_scores
+        bsz, n_heads, q_len, kv_len = ref.shape
+        valid = _build_distill_pair_mask(
+            attention_mask,
+            batch_size=bsz,
+            n_heads=n_heads,
+            q_len=q_len,
+            kv_len=kv_len,
+            device=ref.device,
+        )
+        if not valid.any():
+            return ref.sum() * 0.0
+        kl_dtype = _loss_dtype(ref)
+        return _ChunkedMaskedKL.apply(
+            sparse_scores,
+            teacher_scores.detach(),
+            valid,
+            support_mask,
+            int(query_chunk_size),
+            kl_dtype,
+        )
+
+    if full_weights is None or sparse_weights is None:
+        raise ValueError("attention_distillation_loss needs scores pair or weight pair")
     q_len = full_weights.size(-2)
     total = full_weights.new_zeros(())
     count = 0
-
     for p in range(q_len):
         if p == 0:
             continue
         num_keys = p if prior_key_only else p + 1
-        full_row = full_weights[..., p, :num_keys].float()
-        sparse_row = sparse_weights[..., p, :num_keys].float()
+        row_dtype = _loss_dtype(full_weights)
+        full_row = full_weights[..., p, :num_keys].to(dtype=row_dtype)
+        sparse_row = sparse_weights[..., p, :num_keys].to(dtype=row_dtype)
         full_row = full_row / full_row.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         sparse_row = sparse_row / sparse_row.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         kl = F.kl_div(sparse_row.log().clamp(min=-1e4), full_row.detach(), reduction="batchmean")
         total = total + kl
         count += 1
-
     if count == 0:
         return total
     return total / count
@@ -502,7 +641,7 @@ def _forward_attend_pair_mask(
         q_len=q_len,
         kv_len=kv_len,
         device=device,
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
     )
     if gate is not None:
         valid = valid & gate.bool()
@@ -528,18 +667,77 @@ def _build_distill_pair_mask(
     )
 
 
+class _ChunkedScoresMSELoss(torch.autograd.Function):
+    """MSE on score maps with per-query-chunk backward (caps softmax/MSE grad peak memory)."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        student: torch.Tensor,
+        teacher: torch.Tensor,
+        valid: torch.Tensor,
+        query_chunk_size: int,
+    ) -> torch.Tensor:
+        q_len = student.size(2)
+        chunk = max(1, int(query_chunk_size))
+        acc_dtype = _loss_dtype(student)
+        total_sse = student.new_zeros((), dtype=acc_dtype)
+        total_count = student.new_zeros((), dtype=acc_dtype)
+        with torch.no_grad():
+            for q0 in range(0, q_len, chunk):
+                q1 = min(q0 + chunk, q_len)
+                v = valid[:, :, q0:q1, :]
+                if not v.any():
+                    continue
+                s = student[:, :, q0:q1, :]
+                t = teacher[:, :, q0:q1, :]
+                diff = torch.where(v, s - t, torch.zeros_like(s))
+                total_sse = total_sse + diff.pow(2).sum()
+                total_count = total_count + v.to(dtype=acc_dtype).sum()
+        if total_count.item() < 0.5:
+            ctx.skip_backward = True
+            return _zero_loss_anchor(student)
+        ctx.skip_backward = False
+        ctx.query_chunk_size = chunk
+        ctx.total_count = total_count.clamp(min=1.0)
+        ctx.acc_dtype = acc_dtype
+        ctx.save_for_backward(student, teacher, valid)
+        loss = total_sse / ctx.total_count
+        return loss + _zero_loss_anchor(student)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if getattr(ctx, "skip_backward", False):
+            return None, None, None, None
+        student, teacher, valid = ctx.saved_tensors
+        grad_student = torch.zeros_like(student)
+        chunk = ctx.query_chunk_size
+        inv_denom = (1.0 / ctx.total_count).to(dtype=ctx.acc_dtype)
+        q_len = student.size(2)
+        for q0 in range(0, q_len, chunk):
+            q1 = min(q0 + chunk, q_len)
+            v = valid[:, :, q0:q1, :]
+            if not v.any():
+                continue
+            s = student[:, :, q0:q1, :]
+            t = teacher[:, :, q0:q1, :]
+            diff = torch.where(v, s - t, torch.zeros_like(s))
+            grad_student[:, :, q0:q1, :] = 2.0 * diff * inv_denom
+        return grad_output * grad_student, None, None, None
+
+
 def attention_scores_distillation_loss(
     full_scores: torch.Tensor,
     sparse_scores: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
     *,
-    query_chunk_size: int = 512,
+    query_chunk_size: int = 32,
 ) -> torch.Tensor:
     """
     MSE on pre-softmax logits (student: f(d)×pre-RoPE QK vs teacher: RoPE QK).
 
-    Valid pairs match forward: causal lower-triangle (k <= q) ∩ attention_mask,
-    same visible region as full (teacher) and sparse (student) pre-softmax paths.
+    Valid pairs match forward: causal lower-triangle (k <= q) ∩ attention_mask.
+    Backward is query-chunked in bf16/fp16 to avoid a single large fp32 grad buffer at seq~6K.
     """
     teacher = full_scores.detach()
     student = sparse_scores
@@ -555,26 +753,9 @@ def attention_scores_distillation_loss(
     )
     valid = valid & torch.isfinite(teacher) & torch.isfinite(student)
     if not valid.any():
-        return student.sum() * 0.0
+        return _zero_loss_anchor(student)
 
-    if q_len <= query_chunk_size:
-        return F.mse_loss(student[valid], teacher[valid])
-
-    # Chunked reduction must match global mean over all valid (p,j) pairs.
-    total_sse = student.new_zeros(())
-    total_count = 0
-    for q0 in range(0, q_len, query_chunk_size):
-        q1 = min(q0 + query_chunk_size, q_len)
-        v = valid[:, :, q0:q1, :]
-        if not v.any():
-            continue
-        s = student[:, :, q0:q1, :][v]
-        t = teacher[:, :, q0:q1, :][v]
-        total_sse = total_sse + (s - t).pow(2).sum()
-        total_count += int(v.sum().item())
-    if total_count == 0:
-        return student.sum() * 0.0
-    return total_sse / total_count
+    return _ChunkedScoresMSELoss.apply(student, teacher, valid, int(query_chunk_size))
 
 
 def full_qk_eager_attention_forward(
@@ -601,7 +782,7 @@ def full_qk_eager_attention_forward(
     except ImportError:
         pass
 
-    attn_weights = F.softmax(attn_scores.float(), dim=-1).to(query.dtype)
+    attn_weights = F.softmax(attn_scores, dim=-1)
     attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
@@ -655,7 +836,7 @@ def dense_eager_attention_forward(
     except ImportError:
         pass
 
-    attn_weights = F.softmax(attn_scores.float(), dim=-1).to(query.dtype)
+    attn_weights = F.softmax(attn_scores, dim=-1)
     attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()

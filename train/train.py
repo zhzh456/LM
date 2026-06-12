@@ -18,6 +18,7 @@ from patch_sparse_attn import (
     SPARSE_REL_POS_FILENAME,
     _get_language_model,
     collect_sparse_distill_losses,
+    finalize_sparse_distill_losses,
     iter_attn_with_bias,
     load_sparse_rel_pos_checkpoint,
     patch_model_for_sparse_training,
@@ -218,6 +219,7 @@ class SparseAttentionTrainer(Trainer):
 
         forward_inputs = {k: v for k, v in inputs.items() if k != "labels"}
         outputs = model(**forward_inputs)
+        finalize_sparse_distill_losses(model)
 
         parts = collect_sparse_distill_losses(model)
         mse_raw = parts["mse"]
@@ -239,12 +241,19 @@ class SparseAttentionTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
+        import gc
+
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
         loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
         if not self.baseline_plain_attention:
             for attn in iter_attn_with_bias(model):
                 attn._sparse_kl_loss = None
                 attn._sparse_mse_loss = None
                 attn._sparse_distill_loss = None
+                attn._sparse_distill_extras = None
+                attn._sparse_distill_attention_mask = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return loss

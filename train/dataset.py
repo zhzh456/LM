@@ -17,6 +17,22 @@ DEFAULT_SYSTEM_PROMPT = "You are an expert in understanding dynamics of objects.
 DEFAULT_MAX_PIXELS = 12845056
 QWEN_DEFAULT_MIN_PIXELS = 256 * 28 * 28
 QWEN_FLOOR_MIN_PIXELS = 4 * 28 * 28
+# qwen_vl_utils treats video max_pixels as per-frame cap (not total budget).
+QWEN_VIDEO_MAX_TOKEN_NUM = 768
+QWEN3_IMAGE_PATCH_SIZE = 16
+
+
+def resolve_video_frame_max_pixels(
+    max_pixels: int,
+    num_frames: int,
+    *,
+    image_patch_size: int = QWEN3_IMAGE_PATCH_SIZE,
+) -> int:
+    """Clamp per-frame max_pixels to qwen_vl_utils video limit (avoids resize warnings)."""
+    image_factor = image_patch_size * 2
+    frame_cap = QWEN_VIDEO_MAX_TOKEN_NUM * image_factor * image_factor
+    per_frame_budget = max_pixels // max(num_frames, 1)
+    return min(per_frame_budget, frame_cap)
 
 
 def resolve_min_pixels(max_pixels: int, min_pixels: int | None = None) -> int:
@@ -52,6 +68,7 @@ def build_messages(
     max_pixels: int = DEFAULT_MAX_PIXELS,
 ) -> List[Dict[str, Any]]:
     min_pixels = resolve_min_pixels(max_pixels, min_pixels)
+    frame_max_pixels = resolve_video_frame_max_pixels(max_pixels, num_frames)
     prompt, _, _ = construct_prompt(
         question=doc["question"],
         options=doc["options"],
@@ -61,7 +78,7 @@ def build_messages(
     video_kwargs = {
         "min_pixels": min_pixels,
         "nframes": num_frames,
-        "max_pixels": max_pixels,
+        "max_pixels": frame_max_pixels,
     }
     return [
         {"role": "system", "content": system_prompt},
