@@ -20,9 +20,7 @@ if [[ -n "${RESUME_FROM_CHECKPOINT:-}" && -d "${RESUME_FROM_CHECKPOINT}" ]]; the
   RESUME_ARGS=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
 
-# max_pixels=12845056 (video clips to 786432/frame, seq~6K). Distill uses scores-only path.
-# rel_pos: default prior init (exp decay + wave); lr=0.1, 0.25 epoch.
-# checkpoint every 0.25 epoch -> checkpoint-{step}/sparse_rel_pos_bias.pt
+# Union sparse: content top-500 ∪ distance top-1000 (STE) → RoPE sparse attn; KL + gap-recall.
 accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   --model_path /home/zhanghao360/model/Qwen3-VL-4B-Instruct \
   --output_dir /tmp/qwen3vl-sparse-attn \
@@ -30,13 +28,19 @@ accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   --min_pixels 200704 \
   --num_frames 16 \
   --rel_pos_buckets 16384 \
+  --content_topk_k 500 \
+  --sparse_topk_k 1000 \
+  --ste_tau 0.25 \
+  --sparse_kl_weight 1.0 \
+  --sparse_gap_recall_weight 0.5 \
+  --sparse_dist_score_scale 0.75 \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 1 \
   --num_train_epochs 0.25 \
   --train_layer_id 0 \
   --attn_implementation flash_attention_2 \
-  --learning_rate 0.1 \
-  --warmup_ratio 0.12 \
+  --learning_rate 3e-3 \
+  --warmup_ratio 0.03 \
   --logging_steps 1 \
   --bf16 \
   --distill_every_n_steps 1 \

@@ -12,13 +12,17 @@ SPARSE_REL_POS_FILENAME = "sparse_rel_pos_bias.pt"
 SPARSE_CKPT_META_KEY = "_meta"
 
 from sparse_attention import (
+    DEFAULT_CONTENT_TOPK_K,
+    DEFAULT_SPARSE_TOPK_K,
+    DEFAULT_STE_TAU,
     PerHeadRelativePositionBias,
-    attention_scores_distillation_loss,
+    attention_distillation_loss,
+    attention_distance_gap_recall_loss,
     dense_eager_attention_forward,
     full_qk_eager_attention_forward,
     qk_pre_softmax_scores,
-    sparse_eager_attention_forward,
-    sparse_scores_only_forward,
+    sparse_union_attention_forward,
+    sparse_union_scores_only_forward,
 )
 
 
@@ -104,13 +108,16 @@ def attach_sparse_attention_modules(
     wave_period: float = 32.0,
     wave_amp: float = 0.12,
     noise_std: float = 0.01,
+    sparse_topk_k: int = DEFAULT_SPARSE_TOPK_K,
+    content_topk_k: int = DEFAULT_CONTENT_TOPK_K,
+    target_topk_k: int | None = None,
+    ste_tau: float = DEFAULT_STE_TAU,
+    sparse_kl_weight: float = 1.0,
+    sparse_gap_recall_weight: float = 0.5,
+    sparse_dist_score_scale: float = 0.75,
+    distance_ste_local: bool = True,
 ) -> List[nn.Parameter]:
-    """
-    Register PerHeadRelativePositionBias on a single text self-attn layer.
-
-    Each head gets its own Parameter of shape (num_buckets,):
-      index d -> f(d) multiplying pre-RoPE Q·K/sqrt(d) when (query_pos - key_pos) == d.
-    """
+    """Register PerHeadRelativePositionBias (S[d]) on one text self-attn layer."""
     trainable: List[nn.Parameter] = []
     n_layers = 0
     for layer_idx, attn in enumerate(_iter_text_attention_modules(model)):
@@ -126,7 +133,17 @@ def attach_sparse_attention_modules(
             wave_amp=wave_amp,
             noise_std=noise_std,
         )
+        layer_device = next(attn.parameters()).device
+        bias_module = bias_module.to(device=layer_device, dtype=torch.float32)
         attn.add_module("rel_pos_bias_per_head", bias_module)
+        attn.sparse_content_topk_k = int(content_topk_k)
+        attn.sparse_distance_topk_k = int(sparse_topk_k)
+        attn.sparse_target_topk_k = int(target_topk_k if target_topk_k is not None else sparse_topk_k)
+        attn.sparse_ste_tau = float(ste_tau)
+        attn.sparse_kl_weight = float(sparse_kl_weight)
+        attn.sparse_gap_recall_weight = float(sparse_gap_recall_weight)
+        attn.sparse_dist_score_scale = float(sparse_dist_score_scale)
+        attn.sparse_distance_ste_local = bool(distance_ste_local)
         attn.sparse_topk_ratio = 0.2
         attn.use_sparse_attention = True
         attn._sparse_distill_loss = None
@@ -243,6 +260,14 @@ def _patch_attention_forward(attn: nn.Module) -> None:
             key_pre_rope = key_pre_rope_step
 
         rel_bias = _get_stacked_rel_pos_bias(self)
+        union_kw = dict(
+            rel_pos_bias=rel_bias,
+            content_topk_k=int(getattr(self, "sparse_content_topk_k", DEFAULT_CONTENT_TOPK_K)),
+            distance_topk_k=int(getattr(self, "sparse_distance_topk_k", DEFAULT_SPARSE_TOPK_K)),
+            ste_tau=float(getattr(self, "sparse_ste_tau", DEFAULT_STE_TAU)),
+            dist_score_scale=float(getattr(self, "sparse_dist_score_scale", 0.75)),
+            distance_ste_local=bool(getattr(self, "sparse_distance_ste_local", True)),
+        )
 
         run_distill = getattr(self, "_run_distill_this_step", True)
         sparse_train_layer = getattr(self, "use_sparse_attention", False) and not getattr(self, "sparse_decode_only", False)
@@ -250,26 +275,31 @@ def _patch_attention_forward(attn: nn.Module) -> None:
             self._sparse_kl_loss = None
             self._sparse_mse_loss = None
             self._sparse_distill_loss = None
+            self._sparse_gap_recall_loss = None
             if self.training:
-                sparse_out, _, distill = sparse_scores_only_forward(
+                sparse_out, _, distill = sparse_union_scores_only_forward(
                     self,
                     query_pre_rope,
                     key_pre_rope,
+                    query_states,
+                    key_states,
                     attention_mask,
                     self.scaling,
-                    rel_pos_bias=rel_bias,
+                    **union_kw,
                 )
             else:
-                sparse_out, _, distill = sparse_eager_attention_forward(
+                sparse_out, _, distill = sparse_union_attention_forward(
                     self,
                     query_pre_rope,
                     key_pre_rope,
                     value_states,
+                    query_states,
+                    key_states,
                     attention_mask,
                     self.scaling,
                     dropout=0.0 if not self.training else self.attention_dropout,
-                    rel_pos_bias=rel_bias,
                     return_distill_tensors=True,
+                    **union_kw,
                 )
             if run_distill:
                 with torch.no_grad():
@@ -283,17 +313,16 @@ def _patch_attention_forward(attn: nn.Module) -> None:
                 self._sparse_distill_extras = {
                     "sparse_scores": distill["attn_scores"],
                     "teacher_scores": teacher_scores,
+                    "union_mask": distill["union_mask"],
+                    "mask_c": distill.get("mask_c"),
+                    "mask_d": distill.get("mask_d"),
                 }
                 self._sparse_distill_attention_mask = attention_mask
             else:
                 self._sparse_distill_extras = None
                 self._sparse_distill_attention_mask = None
-            self._sparse_kl_loss = None
-            self._sparse_mse_loss = None
-            self._sparse_distill_loss = None
             attn_output = sparse_out
         else:
-            # Eval: prefill = sparse pre-softmax f(d)*Q_pre*K_pre/sqrt(d); decode = full RoPE QK.
             dropout = 0.0 if not self.training else self.attention_dropout
             sparse_decode_only = getattr(self, "sparse_decode_only", False)
             if sparse_decode_only and query_states.size(-2) == 1:
@@ -307,16 +336,18 @@ def _patch_attention_forward(attn: nn.Module) -> None:
                     dropout=dropout,
                 )
             else:
-                attn_output, _ = dense_eager_attention_forward(
+                attn_output, _ = sparse_union_attention_forward(
                     self,
                     query_pre_rope,
                     key_pre_rope,
                     value_states,
+                    query_states,
+                    key_states,
                     attention_mask,
                     self.scaling,
                     dropout=dropout,
-                    rel_pos_bias=rel_bias,
-                )
+                    **union_kw,
+                )[0:2]
             self._sparse_distill_loss = None
             self._sparse_kl_loss = None
             self._sparse_mse_loss = None
@@ -366,21 +397,44 @@ def patch_model_for_sparse_eval(
 
 
 def finalize_sparse_distill_losses(model: nn.Module) -> None:
-    """Compute score MSE after full forward (keeps peak memory out of nested layer forward)."""
+    """Compute KL + gap-recall after full forward (keeps peak memory out of layer forward)."""
     for attn in _iter_text_attention_modules(model):
         if not getattr(attn, "use_sparse_attention", False):
             continue
         extras = getattr(attn, "_sparse_distill_extras", None)
         if extras is None:
             continue
-        loss_out = attention_scores_distillation_loss(
-            extras["teacher_scores"],
-            extras["sparse_scores"],
-            getattr(attn, "_sparse_distill_attention_mask", None),
+        attention_mask = getattr(attn, "_sparse_distill_attention_mask", None)
+        union_mask = extras.get("union_mask")
+        support = (union_mask > 0.5) if union_mask is not None else None
+        kl_loss = attention_distillation_loss(
+            sparse_scores=extras["sparse_scores"],
+            teacher_scores=extras["teacher_scores"],
+            attention_mask=attention_mask,
+            support_mask=support,
         )
-        attn._sparse_kl_loss = None
-        attn._sparse_mse_loss = loss_out
-        attn._sparse_distill_loss = loss_out
+        gap_loss = gap_recall = union_recall = None
+        mask_c = extras.get("mask_c")
+        mask_d = extras.get("mask_d")
+        if mask_c is not None and mask_d is not None:
+            gap_loss, gap_recall, union_recall = attention_distance_gap_recall_loss(
+                extras["teacher_scores"],
+                mask_d,
+                mask_c,
+                attention_mask,
+                int(getattr(attn, "sparse_target_topk_k", DEFAULT_SPARSE_TOPK_K)),
+            )
+        kl_w = float(getattr(attn, "sparse_kl_weight", 1.0))
+        gap_w = float(getattr(attn, "sparse_gap_recall_weight", 0.5))
+        distill_loss = kl_w * kl_loss
+        if gap_loss is not None:
+            distill_loss = distill_loss + gap_w * gap_loss
+        attn._sparse_kl_loss = kl_loss
+        attn._sparse_gap_recall_loss = gap_loss
+        attn._sparse_gap_recall = gap_recall
+        attn._sparse_topk_recall = union_recall
+        attn._sparse_mse_loss = None
+        attn._sparse_distill_loss = distill_loss
         attn._sparse_distill_extras = None
         attn._sparse_distill_attention_mask = None
 
@@ -391,26 +445,36 @@ def collect_sparse_distill_loss(model: nn.Module) -> torch.Tensor | None:
 
 
 def collect_sparse_distill_losses(model: nn.Module) -> dict[str, torch.Tensor | None]:
-    kl_total = mse_total = distill_total = None
-    n_kl = n_mse = 0
+    kl_total = gap_total = distill_total = None
+    gap_recall = union_recall = None
+    n = 0
     for attn in _iter_text_attention_modules(model):
         if not getattr(attn, "use_sparse_attention", False):
             continue
         kl = getattr(attn, "_sparse_kl_loss", None)
-        mse = getattr(attn, "_sparse_mse_loss", None)
+        gap = getattr(attn, "_sparse_gap_recall_loss", None)
+        distill = getattr(attn, "_sparse_distill_loss", None)
         if kl is not None:
             kl_total = kl if kl_total is None else kl_total + kl
-            n_kl += 1
-        if mse is not None:
-            mse_total = mse if mse_total is None else mse_total + mse
-            n_mse += 1
-    if kl_total is not None and n_kl > 0:
-        kl_total = kl_total / n_kl
-        distill_total = kl_total
-    if mse_total is not None and n_mse > 0:
-        mse_total = mse_total / n_mse
-        distill_total = mse_total if distill_total is None else distill_total + mse_total
-    return {"kl": kl_total, "mse": mse_total, "distill": distill_total}
+        if gap is not None:
+            gap_total = gap if gap_total is None else gap_total + gap
+        if distill is not None:
+            distill_total = distill if distill_total is None else distill_total + distill
+            n += 1
+        gr = getattr(attn, "_sparse_gap_recall", None)
+        ur = getattr(attn, "_sparse_topk_recall", None)
+        if gr is not None:
+            gap_recall = gr if gap_recall is None else (gap_recall + gr) / 2.0
+        if ur is not None:
+            union_recall = ur if union_recall is None else (union_recall + ur) / 2.0
+    return {
+        "kl": kl_total,
+        "gap": gap_total,
+        "distill": distill_total,
+        "gap_recall": gap_recall,
+        "union_recall": union_recall,
+        "mse": None,
+    }
 
 
 def trainable_sparse_parameters(model: nn.Module) -> List[nn.Parameter]:
@@ -473,12 +537,17 @@ def save_sparse_rel_pos_checkpoint(model: nn.Module, output_dir: str) -> str:
         tensors[f"layer_{layer_idx}.sparse_topk_ratio"] = torch.tensor(getattr(attn, "sparse_topk_ratio", 0.2))
 
     meta = {
-        "format_version": 1,
+        "format_version": 3,
         "train_layer_id": layer_ids[0] if len(layer_ids) == 1 else layer_ids,
         "rel_pos_buckets": rel_pos_buckets,
         "num_heads": num_heads,
         "num_sparse_layers": len(layer_ids),
     }
+    if attns:
+        a0 = attns[0]
+        meta["sparse_topk_k"] = int(getattr(a0, "sparse_distance_topk_k", DEFAULT_SPARSE_TOPK_K))
+        meta["content_topk_k"] = int(getattr(a0, "sparse_content_topk_k", DEFAULT_CONTENT_TOPK_K))
+        meta["ste_tau"] = float(getattr(a0, "sparse_ste_tau", DEFAULT_STE_TAU))
     payload = {SPARSE_CKPT_META_KEY: meta, **tensors}
     torch.save(payload, path)
 
@@ -519,6 +588,12 @@ def load_sparse_rel_pos_checkpoint(
         layer_idx = int(getattr(attn, "_sparse_layer_idx", 0))
         if expected_layer_id is not None and layer_idx != expected_layer_id:
             continue
+        if meta.get("sparse_topk_k") is not None:
+            attn.sparse_distance_topk_k = int(meta["sparse_topk_k"])
+        if meta.get("content_topk_k") is not None:
+            attn.sparse_content_topk_k = int(meta["content_topk_k"])
+        if meta.get("ste_tau") is not None:
+            attn.sparse_ste_tau = float(meta["ste_tau"])
         for h, p in enumerate(attn.rel_pos_bias_per_head.head_biases):
             key = f"layer_{layer_idx}.head_{h}"
             if key not in tensors:

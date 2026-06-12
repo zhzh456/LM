@@ -65,10 +65,31 @@ def parse_args():
     p.add_argument("--gradient_accumulation_steps", type=int, default=8)
     p.add_argument("--learning_rate", type=float, default=1e-3)
     p.add_argument(
+        "--sparse_topk_k",
+        type=int,
+        default=1000,
+        help="Distance-branch top-k per query (union with content top-k).",
+    )
+    p.add_argument(
+        "--content_topk_k",
+        type=int,
+        default=500,
+        help="Content-branch top-k per query (pre-RoPE Q·K, hard detach).",
+    )
+    p.add_argument("--ste_tau", type=float, default=0.25, help="STE softmax temperature for distance top-k.")
+    p.add_argument("--sparse_kl_weight", type=float, default=1.0)
+    p.add_argument("--sparse_gap_recall_weight", type=float, default=0.5)
+    p.add_argument(
+        "--sparse_dist_score_scale",
+        type=float,
+        default=0.75,
+        help="Add scale*mask_d*S[d] to RoPE QK logits (grad path for S[d]).",
+    )
+    p.add_argument(
         "--sparse_topk_ratio",
         type=float,
         default=0.2,
-        help="Deprecated (top-k removed in pure-position mode). Ignored.",
+        help="Deprecated; kept for checkpoint compatibility only.",
     )
     p.add_argument("--rel_pos_buckets", type=int, default=16384, help="Per-head bias length (16K)")
     p.add_argument("--rel_pos_near_tau", type=float, default=128.0, help="Init decay for distance (smaller=sharper near bias)")
@@ -222,18 +243,28 @@ class SparseAttentionTrainer(Trainer):
         finalize_sparse_distill_losses(model)
 
         parts = collect_sparse_distill_losses(model)
-        mse_raw = parts["mse"]
-        if mse_raw is None or not run_distill:
+        distill_raw = parts["distill"]
+        if distill_raw is None or not run_distill:
             raise RuntimeError("No distill loss on this step; set distill_every_n_steps=1 or enable teacher forward.")
-        loss = mse_raw
+        loss = distill_raw
         log_dict: dict[str, float] = {
-            "loss_score_mse": float(loss.detach().item()),
             "loss": float(loss.detach().item()),
         }
+        if parts.get("kl") is not None:
+            log_dict["loss_kl"] = float(parts["kl"].detach().item())
+        if parts.get("gap") is not None:
+            log_dict["loss_gap"] = float(parts["gap"].detach().item())
+        if parts.get("gap_recall") is not None:
+            log_dict["gap_recall"] = float(parts["gap_recall"].detach().item())
+        if parts.get("union_recall") is not None:
+            log_dict["union_recall"] = float(parts["union_recall"].detach().item())
         log_dict["distill_active"] = int(run_distill)
         self._last_step_metrics = {
             "loss_total": log_dict["loss"],
-            "loss_score_mse": log_dict["loss_score_mse"],
+            "loss_kl": log_dict.get("loss_kl"),
+            "loss_gap": log_dict.get("loss_gap"),
+            "gap_recall": log_dict.get("gap_recall"),
+            "union_recall": log_dict.get("union_recall"),
             "distill_active": run_distill,
             "seq_len": length_stats["seq_len"],
         }
@@ -251,6 +282,9 @@ class SparseAttentionTrainer(Trainer):
             for attn in iter_attn_with_bias(model):
                 attn._sparse_kl_loss = None
                 attn._sparse_mse_loss = None
+                attn._sparse_gap_recall_loss = None
+                attn._sparse_gap_recall = None
+                attn._sparse_topk_recall = None
                 attn._sparse_distill_loss = None
                 attn._sparse_distill_extras = None
                 attn._sparse_distill_attention_mask = None
@@ -274,12 +308,27 @@ class SparseAttentionTrainer(Trainer):
         def _fmt(v: float) -> str:
             return "nan" if v != v else f"{v:.6f}"
 
-        mse = float(m.get("loss_score_mse", float("nan")))
+        loss_kl = m.get("loss_kl")
+        loss_gap = m.get("loss_gap")
+        gap_recall = m.get("gap_recall")
+        union_recall = m.get("union_recall")
         distill_on = bool(m.get("distill_active", False))
         seq_len = m.get("seq_len", "na")
 
+        extra = ""
+        if loss_kl is not None:
+            extra += f" loss_kl={_fmt(float(loss_kl))}"
+        if loss_gap is not None:
+            extra += f" loss_gap={_fmt(float(loss_gap))}"
+        if gap_recall is not None:
+            extra += f" gap_recall={_fmt(float(gap_recall))}"
+        if union_recall is not None:
+            extra += f" union_recall={_fmt(float(union_recall))}"
+
         print(
-            f"[train] step={step} epoch={epoch:.4f} seq_len={seq_len} " f"loss={_fmt(loss_total)} loss_score_mse={_fmt(mse)} " f"distill={int(distill_on)} " f"lr={float(lr):.6g} grad_norm={float(grad):.6f}",
+            f"[train] step={step} epoch={epoch:.4f} seq_len={seq_len} "
+            f"loss={_fmt(loss_total)}{extra} distill={int(distill_on)} "
+            f"lr={float(lr):.6g} grad_norm={float(grad):.6f}",
             flush=True,
         )
 
@@ -349,9 +398,14 @@ def main():
             wave_period=args.rel_pos_wave_period,
             wave_amp=args.rel_pos_wave_amp,
             noise_std=args.rel_pos_noise_std,
+            sparse_topk_k=args.sparse_topk_k,
+            content_topk_k=args.content_topk_k,
+            target_topk_k=args.sparse_topk_k,
+            ste_tau=args.ste_tau,
+            sparse_kl_weight=args.sparse_kl_weight,
+            sparse_gap_recall_weight=args.sparse_gap_recall_weight,
+            sparse_dist_score_scale=args.sparse_dist_score_scale,
         )
-        for attn in iter_attn_with_bias(model):
-            attn.sparse_topk_ratio = args.sparse_topk_ratio
 
         trainable = trainable_sparse_parameters(model)
         n_params = sum(p.numel() for p in trainable)

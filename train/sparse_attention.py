@@ -9,8 +9,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# rel_pos[d] = f(d): multiplicative factor on pre-RoPE Q·K/sqrt(d) when (query_pos - key_pos) == d
+# S[d]: per-head distance score for union-sparse key selection (content top-k ∪ distance top-k).
 REL_POS_BUCKETS = 16384
+DEFAULT_SPARSE_TOPK_K = 1000
+DEFAULT_CONTENT_TOPK_K = 500
+DEFAULT_STE_TAU = 0.25
 
 
 def build_relative_position_init(
@@ -45,8 +48,7 @@ class PerHeadRelativePositionBias(nn.Module):
     """
     Each attention head has its own trainable vector of length num_buckets (default 16384).
 
-    Index d is f(d): multiplicative factor on pre-RoPE Q·K/sqrt(d) when
-    (q_pos - k_pos) == d (d=0: same position, d=1: one step back, ...).
+    Index d is S[d]: distance score when |q_pos - k_pos| == d, used for distance-branch top-k.
     """
 
     def __init__(
@@ -115,6 +117,405 @@ def build_relative_position_bias(
     bias = rel_pos_bias[:, rel_dist_clamped]  # (heads, q, k)
     bias = bias.masked_fill((rel_dist < 0).unsqueeze(0), 0.0)
     return bias.unsqueeze(0)
+
+
+def build_absolute_distance_logits(
+    rel_pos_bias: torch.Tensor,
+    q_len: int,
+    kv_len: int,
+) -> torch.Tensor:
+    """Lookup S[|q-k|] per head; invalid causal pairs get -inf. Returns (1, H, Q, K)."""
+    device = rel_pos_bias.device
+    dtype = rel_pos_bias.dtype
+    q_pos = (kv_len - q_len) + torch.arange(q_len, device=device)
+    k_pos = torch.arange(kv_len, device=device)
+    rel_dist = (q_pos[:, None] - k_pos[None, :]).abs()
+    max_bucket = rel_pos_bias.shape[1]
+    rel_dist_clamped = rel_dist.clamp(0, max_bucket - 1)
+    logits = rel_pos_bias[:, rel_dist_clamped]
+    logits = logits.masked_fill(rel_dist < 0, torch.finfo(dtype).min)
+    return logits.unsqueeze(0).to(dtype=dtype)
+
+
+def differentiable_topk_ste(logits: torch.Tensor, k: int, tau: float = DEFAULT_STE_TAU) -> torch.Tensor:
+    """STE top-k mask along last dim: forward hard 0/1, backward via softmax(logits/tau)."""
+    k = min(int(k), logits.size(-1))
+    if k <= 0:
+        return torch.zeros_like(logits)
+    if k >= logits.size(-1):
+        return torch.ones_like(logits)
+    top_idx = torch.topk(logits, k, dim=-1).indices
+    hard = torch.zeros_like(logits)
+    hard.scatter_(-1, top_idx, torch.ones_like(top_idx, dtype=logits.dtype))
+    soft = torch.softmax(logits / max(float(tau), 1e-6), dim=-1).to(dtype=logits.dtype)
+    return (hard - soft.detach() + soft).to(dtype=logits.dtype)
+
+
+def differentiable_topk_ste_local(
+    logits: torch.Tensor,
+    k: int,
+    tau: float = DEFAULT_STE_TAU,
+    *,
+    candidate_mult: int = 2,
+) -> torch.Tensor:
+    """STE top-k with gradients localized to top-(mult*k) candidates."""
+    k = min(int(k), logits.size(-1))
+    if k <= 0:
+        return torch.zeros_like(logits)
+    if k >= logits.size(-1):
+        return torch.ones_like(logits)
+    cand_k = min(logits.size(-1), max(k, k * int(candidate_mult)))
+    top_vals, top_idx = torch.topk(logits, cand_k, dim=-1)
+    ste_sub = differentiable_topk_ste(top_vals, k, tau).to(dtype=logits.dtype)
+    out = torch.zeros_like(logits)
+    out.scatter_(-1, top_idx, ste_sub)
+    return out
+
+
+def hard_topk_mask(logits: torch.Tensor, k: int) -> torch.Tensor:
+    k = min(int(k), logits.size(-1))
+    if k <= 0:
+        return torch.zeros_like(logits)
+    if k >= logits.size(-1):
+        return torch.ones_like(logits)
+    top_idx = torch.topk(logits, k, dim=-1).indices
+    hard = torch.zeros_like(logits)
+    hard.scatter_(-1, top_idx, torch.ones_like(top_idx, dtype=logits.dtype))
+    return hard
+
+
+def content_pre_rope_logits(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+) -> torch.Tensor:
+    """Pre-RoPE Q·K/sqrt(d) for content top-k (Q/K detached; backbone frozen)."""
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import repeat_kv
+
+    batch_size = query.size(0)
+    n_heads = query.size(1)
+    q_len = query.size(-2)
+    kv_len = key.size(-2)
+
+    key_states = repeat_kv(key.detach(), module.num_key_value_groups)
+    logits = torch.matmul(query.detach(), key_states.transpose(2, 3)) * scaling
+
+    gate = _pair_attend_gate(
+        attention_mask,
+        batch_size=batch_size,
+        n_heads=n_heads,
+        q_len=q_len,
+        kv_len=kv_len,
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    if gate is not None:
+        logits = logits * gate
+
+    return _apply_pre_softmax_attention_mask(
+        logits,
+        attention_mask,
+        batch_size=batch_size,
+        n_heads=n_heads,
+        q_len=q_len,
+        kv_len=kv_len,
+    )
+
+
+def build_union_sparse_mask(
+    content_logits: torch.Tensor,
+    distance_logits: torch.Tensor,
+    *,
+    content_topk_k: int,
+    distance_topk_k: int,
+    ste_tau: float,
+    valid_mask: torch.Tensor,
+    training: bool,
+    distance_ste_local: bool = True,
+    return_masks: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Content top-k ∪ distance top-k on pre-RoPE scores.
+
+    Content branch is hard top-k (detach). Distance branch uses STE top-k for S[d] grads.
+    """
+    neg_inf = torch.finfo(content_logits.dtype).min
+    valid = valid_mask.bool()
+    c_logits = content_logits.masked_fill(~valid, neg_inf)
+    d_logits = distance_logits.masked_fill(~valid, neg_inf)
+    valid_f = valid.to(dtype=content_logits.dtype)
+
+    if training:
+        mask_c = hard_topk_mask(c_logits, content_topk_k).detach() * valid_f
+        ste_fn = differentiable_topk_ste_local if distance_ste_local else differentiable_topk_ste
+        mask_d = ste_fn(d_logits, distance_topk_k, ste_tau) * valid_f
+        union = torch.maximum(mask_c, mask_d)
+    else:
+        mask_c = hard_topk_mask(c_logits, content_topk_k) * valid_f
+        mask_d = hard_topk_mask(d_logits, distance_topk_k) * valid_f
+        union = torch.maximum(mask_c, mask_d)
+
+    if return_masks:
+        return union, mask_c, mask_d
+    return union
+
+
+def _sparse_union_attn_scores(
+    module: nn.Module,
+    query_rope: torch.Tensor,
+    key_rope: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    *,
+    rel_pos_bias: torch.Tensor,
+    query_pre: torch.Tensor,
+    key_pre: torch.Tensor,
+    content_topk_k: int,
+    distance_topk_k: int,
+    ste_tau: float,
+    dist_score_scale: float,
+    distance_ste_local: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    batch_size = query_rope.size(0)
+    n_heads = query_rope.size(1)
+    q_len = query_rope.size(-2)
+    kv_len = key_rope.size(-2)
+
+    valid = _forward_attend_pair_mask(
+        attention_mask,
+        batch_size=batch_size,
+        n_heads=n_heads,
+        q_len=q_len,
+        kv_len=kv_len,
+        device=query_rope.device,
+    )
+
+    rel_fp32 = rel_pos_bias.float()
+    dist_logits = build_absolute_distance_logits(rel_fp32, q_len, kv_len).to(query_rope.dtype)
+    content_logits = content_pre_rope_logits(module, query_pre, key_pre, attention_mask, scaling)
+
+    training = bool(getattr(module, "training", False))
+    mask_c = mask_d = None
+    if training:
+        union_mask, mask_c, mask_d = build_union_sparse_mask(
+            content_logits,
+            dist_logits,
+            content_topk_k=content_topk_k,
+            distance_topk_k=distance_topk_k,
+            ste_tau=ste_tau,
+            valid_mask=valid,
+            training=True,
+            distance_ste_local=distance_ste_local,
+            return_masks=True,
+        )
+    else:
+        union_mask = build_union_sparse_mask(
+            content_logits,
+            dist_logits,
+            content_topk_k=content_topk_k,
+            distance_topk_k=distance_topk_k,
+            ste_tau=ste_tau,
+            valid_mask=valid,
+            training=False,
+            distance_ste_local=distance_ste_local,
+        )
+
+    rope_scores = qk_pre_softmax_scores(module, query_rope, key_rope, attention_mask, scaling)
+    union_hard = (union_mask.detach() > 0.5).to(dtype=rope_scores.dtype)
+    blocked = torch.finfo(rope_scores.dtype).min
+    attn_scores = rope_scores.masked_fill(union_hard < 0.5, blocked)
+    if dist_score_scale != 0.0 and mask_d is not None:
+        attn_scores = attn_scores + float(dist_score_scale) * mask_d * dist_logits.to(attn_scores.dtype)
+
+    return attn_scores, union_mask, mask_c, mask_d
+
+
+def sparse_union_attention_forward(
+    module: nn.Module,
+    query_pre: torch.Tensor,
+    key_pre: torch.Tensor,
+    value: torch.Tensor,
+    query_rope: torch.Tensor,
+    key_rope: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+    *,
+    rel_pos_bias: torch.Tensor,
+    content_topk_k: int = DEFAULT_CONTENT_TOPK_K,
+    distance_topk_k: int = DEFAULT_SPARSE_TOPK_K,
+    ste_tau: float = DEFAULT_STE_TAU,
+    dist_score_scale: float = 0.75,
+    distance_ste_local: bool = True,
+    return_distill_tensors: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[dict]]:
+    """Union-sparse attention: select keys then RoPE QK softmax @ V."""
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import repeat_kv
+
+    value_states = repeat_kv(value, module.num_key_value_groups).to(query_rope.device)
+    attn_scores, union_mask, mask_c, mask_d = _sparse_union_attn_scores(
+        module,
+        query_rope,
+        key_rope,
+        attention_mask,
+        scaling,
+        rel_pos_bias=rel_pos_bias,
+        query_pre=query_pre,
+        key_pre=key_pre,
+        content_topk_k=content_topk_k,
+        distance_topk_k=distance_topk_k,
+        ste_tau=ste_tau,
+        dist_score_scale=dist_score_scale,
+        distance_ste_local=distance_ste_local,
+    )
+
+    attn_weights = F.softmax(attn_scores, dim=-1)
+    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    extras: dict | None = None
+    if return_distill_tensors:
+        extras = {
+            "attn_scores": attn_scores,
+            "union_mask": union_mask,
+            "mask_c": mask_c,
+            "mask_d": mask_d,
+        }
+    return attn_output, attn_weights, extras
+
+
+def sparse_union_scores_only_forward(
+    module: nn.Module,
+    query_pre: torch.Tensor,
+    key_pre: torch.Tensor,
+    query_rope: torch.Tensor,
+    key_rope: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    *,
+    rel_pos_bias: torch.Tensor,
+    content_topk_k: int = DEFAULT_CONTENT_TOPK_K,
+    distance_topk_k: int = DEFAULT_SPARSE_TOPK_K,
+    ste_tau: float = DEFAULT_STE_TAU,
+    dist_score_scale: float = 0.75,
+    distance_ste_local: bool = True,
+) -> Tuple[torch.Tensor, None, dict]:
+    """Distill-only: union mask + pre-softmax scores; skip softmax @ V."""
+    attn_scores, union_mask, mask_c, mask_d = _sparse_union_attn_scores(
+        module,
+        query_rope,
+        key_rope,
+        attention_mask,
+        scaling,
+        rel_pos_bias=rel_pos_bias,
+        query_pre=query_pre,
+        key_pre=key_pre,
+        content_topk_k=content_topk_k,
+        distance_topk_k=distance_topk_k,
+        ste_tau=ste_tau,
+        dist_score_scale=dist_score_scale,
+        distance_ste_local=distance_ste_local,
+    )
+    b, q, h, d = query_rope.size(0), query_rope.size(-2), query_rope.size(1), query_rope.size(-1)
+    dummy = torch.zeros(b, q, h * d, device=query_rope.device, dtype=query_rope.dtype)
+    extras = {
+        "attn_scores": attn_scores,
+        "union_mask": union_mask,
+        "mask_c": mask_c,
+        "mask_d": mask_d,
+    }
+    return dummy, None, extras
+
+
+def attention_distance_gap_recall_loss(
+    teacher_scores: torch.Tensor,
+    mask_d: torch.Tensor,
+    mask_c: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    target_topk_k: int,
+    *,
+    query_chunk_size: int = 64,
+    max_query_rows: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Train S[d] on baseline top-k keys that content did NOT select.
+
+    gap = teacher_topk \\ content; recall_gap = |gap ∩ mask_d| / |gap|.
+    Returns (loss, gap_recall, union_recall) scalars.
+    """
+    bsz, n_heads, q_len, kv_len = teacher_scores.shape
+    device = teacher_scores.device
+    valid = _build_distill_pair_mask(
+        attention_mask,
+        batch_size=bsz,
+        n_heads=n_heads,
+        q_len=q_len,
+        kv_len=kv_len,
+        device=device,
+    )
+    k = min(int(target_topk_k), kv_len)
+    neg_inf = torch.tensor(-1e4, device=device, dtype=teacher_scores.dtype)
+
+    loss_sum = teacher_scores.new_zeros((), dtype=torch.float32)
+    gap_recall_sum = teacher_scores.new_zeros((), dtype=torch.float32)
+    union_recall_sum = teacher_scores.new_zeros((), dtype=torch.float32)
+    n_gap_rows = teacher_scores.new_zeros((), dtype=torch.float32)
+    n_union_rows = teacher_scores.new_zeros((), dtype=torch.float32)
+
+    mask_c_hard = mask_c.detach() > 0.5
+    union_soft = torch.maximum(mask_c.detach(), mask_d)
+    q_limit = min(q_len, max(1, int(max_query_rows)))
+    chunk = max(1, int(query_chunk_size))
+
+    for q0 in range(0, q_limit, chunk):
+        q1 = min(q0 + chunk, q_limit)
+        valid_chunk = valid[:, :, q0:q1, :]
+        if not valid_chunk.any():
+            continue
+
+        t_logits = teacher_scores[:, :, q0:q1, :].masked_fill(~valid_chunk, neg_inf)
+        _, top_idx = torch.topk(t_logits, k, dim=-1)
+        full_topk = torch.zeros_like(t_logits, dtype=torch.bool)
+        full_topk.scatter_(-1, top_idx, True)
+        full_topk = full_topk & valid_chunk
+
+        mc = mask_c_hard[:, :, q0:q1, :]
+        md = mask_d[:, :, q0:q1, :]
+        un = union_soft[:, :, q0:q1, :] > 0.5
+
+        gap = full_topk & ~mc
+        gap_cnt = gap.float().sum(dim=-1)
+        hit = (gap.float() * md).sum(dim=-1)
+        gap_rows = gap_cnt > 0.5
+        if gap_rows.any():
+            row_recall = (hit / gap_cnt.clamp(min=1.0)).masked_select(gap_rows)
+            gap_recall_sum = gap_recall_sum + row_recall.sum()
+            loss_sum = loss_sum + (1.0 - row_recall).sum()
+            n_gap_rows = n_gap_rows + gap_rows.float().sum()
+
+        union_hit = (full_topk.float() * un.float()).sum(dim=-1)
+        valid_rows = valid_chunk.any(dim=-1)
+        if valid_rows.any():
+            ur = (union_hit / float(k)).masked_select(valid_rows)
+            union_recall_sum = union_recall_sum + ur.sum()
+            n_union_rows = n_union_rows + valid_rows.float().sum()
+
+    if n_gap_rows.item() < 0.5:
+        loss = _zero_loss_anchor(mask_d)
+        gap_recall = mask_d.new_zeros(())
+    else:
+        loss = loss_sum / n_gap_rows
+        gap_recall = gap_recall_sum / n_gap_rows
+
+    if n_union_rows.item() < 0.5:
+        union_recall = mask_d.new_zeros(())
+    else:
+        union_recall = union_recall_sum / n_union_rows
+
+    return loss + _zero_loss_anchor(mask_d) * 0.0, gap_recall.detach(), union_recall.detach()
 
 
 def apply_sparse_topk_mask(
