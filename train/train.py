@@ -319,9 +319,7 @@ class SparseAttentionTrainer(Trainer):
             extra += f" union_recall={_fmt(float(union_recall))}"
 
         print(
-            f"[train] step={step} epoch={epoch:.4f} seq_len={seq_len} "
-            f"loss={_fmt(loss_total)}{extra} distill={int(distill_on)} "
-            f"lr={float(lr):.6g} grad_norm={float(grad):.6f}",
+            f"[train] step={step} epoch={epoch:.4f} seq_len={seq_len} " f"loss={_fmt(loss_total)}{extra} distill={int(distill_on)} " f"lr={float(lr):.6g} grad_norm={float(grad):.6f}",
             flush=True,
         )
 
