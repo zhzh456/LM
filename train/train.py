@@ -77,7 +77,7 @@ def parse_args():
     p.add_argument(
         "--train_layer_id",
         type=int,
-        default=35,
+        default=18,
         help="Text decoder layer index to train sparse rel-pos on (0-based)",
     )
     p.add_argument(

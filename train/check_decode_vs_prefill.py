@@ -18,7 +18,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--task", default="mmbench_en_dev", choices=["mmbench_en_dev", "tomato"])
     p.add_argument("--model_path", default="/home/zhanghao360/model/Qwen3-VL-4B-Instruct")
-    p.add_argument("--sparse-layer-id", type=int, default=35)
+    p.add_argument("--sparse-layer-id", type=int, default=18)
     args = p.parse_args()
 
     from datasets import load_dataset

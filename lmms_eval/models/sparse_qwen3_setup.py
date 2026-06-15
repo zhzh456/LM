@@ -38,7 +38,7 @@ def setup_sparse_attention_for_eval(
     *,
     rel_pos_path: str,
     rel_pos_buckets: int = 16384,
-    layer_id: int = 35,
+    layer_id: int = 18,
     save_attn_scores_dir: str | None = None,
 ) -> None:
     """Eval: one layer uses sparse pre-RoPE attention; others keep default."""
