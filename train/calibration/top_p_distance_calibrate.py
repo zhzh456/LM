@@ -222,7 +222,9 @@ def _q_positions_from_pad_mask(
 
 def _set_calib_pad_mask(model: torch.nn.Module, pad_mask_2d: torch.Tensor | None) -> None:
     for attn in _iter_text_attention_modules(model):
-        if getattr(attn, "_calib_capture_patched", False):
+        if getattr(attn, "_calib_capture_patched", False) or getattr(
+            attn, "_calib_decode_capture_patched", False
+        ):
             attn._calib_pad_mask_2d = pad_mask_2d
 
 
