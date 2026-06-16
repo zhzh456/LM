@@ -5,6 +5,7 @@ export http_proxy=http://10.229.18.27:8412
 export https_proxy=http://10.229.18.27:8412
 export HTTP_PROXY=http://10.229.18.27:8412
 export HTTPS_PROXY=http://10.229.18.27:8412
+export CUDA_VISIBLE_DEVICES=0
 # Reduce CUDA allocator fragmentation (helps large contiguous backward allocs).
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
@@ -31,7 +32,7 @@ accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 1 \
   --num_train_epochs 0.25 \
-  --train_layer_id 35 \
+  --train_layer_id 18 \
   --attn_implementation flash_attention_2 \
   --learning_rate 0.1 \
   --warmup_ratio 0.12 \
@@ -47,4 +48,4 @@ accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
 # bash train/run_train.sh --rel_pos_init_path /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias.pt
 # layer0 backup: /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias_layer0.pt
 # layer18 backup: /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias_layer18.pt
-# layer35 backup: /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias_layer35.pt
+# layer18 backup: /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias_layer18.pt
