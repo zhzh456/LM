@@ -14,8 +14,8 @@ export PYTHONPATH="$(cd ../.. && pwd):${PYTHONPATH:-}"
 python top_p_post_mass_calibrate.py \
   --model_path /home/zhanghao360/model/Qwen3-VL-4B-Instruct \
   --distance_excel_dir /tmp/qwen3vl-calib-test/update/all/excel/layer_00 \
-  --distance_topk_ratio 0.03 \
-  --pre_qk_topk_ratio 0.17 \
+  --distance_topk_ratio 0 \
+  --pre_qk_topk_ratio 0.2 \
   --max_pixels 12845056 \
   --min_pixels 200704 \
   --num_frames 16 \
@@ -27,3 +27,4 @@ python top_p_post_mass_calibrate.py \
   --attn_implementation eager \
   --bf16 \
   "$@"
+  

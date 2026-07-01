@@ -1,0 +1,117 @@
+commit 06357b13f13acc44a2587e14f2ed471386d7cffa
+Author: github-actions[bot] <github-actions[bot]@users.noreply.github.com>
+Date:   Tue Jun 9 08:48:43 2026 +0000
+
+    style: auto-fix lint (black + isort)
+
+commit ea08dbc5bd595ad4e689c998a79f388020972f72
+Merge: ee76b64 099d41c
+Author: zhzh456 <1989070006@qq.com>
+Date:   Tue Jun 9 16:47:30 2026 +0800
+
+    Merge branch 'main' of github.com:zhzh456/LM
+
+commit ee76b644511674d1f71ebb7bd413f400f8106a4a
+Author: zhzh456 <1989070006@qq.com>
+Date:   Tue Jun 9 16:47:07 2026 +0800
+
+    Update training configurations and layer settings for sparse attention
+    
+    - Changed the default training layer from 0 to 35 in multiple scripts to focus on a specific layer for sparse attention training.
+    - Adjusted the training ratio in `train.py` to 1.0, utilizing the entire dataset for training without evaluation.
+    - Updated learning rate in `run_train.sh` from 1 to 0.1 and modified training epochs to 0.25 for improved training efficiency.
+    - Enhanced the README.md to reflect the new training configurations and layer specifications.
+    - Refined attention score handling in `attn_score_dump.py` to accommodate the new layer settings.
+
+commit 099d41c0a6909e4ebc49fbea4db66a3af52e69f7
+Author: github-actions[bot] <github-actions[bot]@users.noreply.github.com>
+Date:   Mon Jun 8 05:58:07 2026 +0000
+
+    style: auto-fix lint (black + isort)
+
+commit d805c813342652eef8c7b466abc19abd99b62af2
+Author: zhzh456 <1989070006@qq.com>
+Date:   Mon Jun 8 13:52:28 2026 +0800
+
+    Improve sparse attention evaluation and training efficiency
+    
+    - Enhanced the handling of attention masks in `sparse_attention.py` to support varying input lengths during training and evaluation.
+    - Updated the `_patch_attention_forward` method to better differentiate between sparse and dense attention paths, optimizing evaluation performance.
+    - Adjusted `plot_rel_pos_weights.py` to increase the default `max-distance` for plotting and improve axis label clarity.
+    - Refined documentation in the `Qwen3_VL_Sparse` class to clarify the use of sparse pre-softmax during prefill and full RoPE QK during decoding.
+
+commit 18a9d5b63c52c21fb949e87cd8deafd3aee15261
+Author: zhzh456 <1989070006@qq.com>
+Date:   Mon Jun 8 13:52:05 2026 +0800
+
+    Refine sparse attention implementation and evaluation setup
+    
+    - Updated `Qwen3_VL_Sparse` class documentation to clarify the use of sparse pre-softmax during prefill and full RoPE QK during decoding.
+    - Enhanced `_patch_attention_forward` to differentiate between sparse and dense attention paths, improving evaluation efficiency.
+    - Adjusted `plot_rel_pos_weights.py` to increase the default `max-distance` for plotting and updated axis labels for clarity.
+    - Improved handling of attention masks in `sparse_attention.py` to accommodate varying input lengths during training and evaluation.
+
+commit 8e3498ff480994a3ffe4597e6f18327b01391969
+Author: zhzh456 <1989070006@qq.com>
+Date:   Mon Jun 8 13:51:56 2026 +0800
+
+    Update learning rate in training script for improved performance
+    
+    - Adjusted the learning rate from 0.1 to 1 in `run_train.sh` to enhance training efficiency.
+    - Updated comments to reflect the change in learning rate and its impact on training epochs.
+
+commit 52e3d92ab985b68f09a977d18db7966a369c19c3
+Author: zhzh456 <1989070006@qq.com>
+Date:   Mon Jun 8 11:29:47 2026 +0800
+
+    Enhance attention score dumping and NDCG metric evaluation
+    
+    - Introduced a new `dump_mode` parameter in `enable_attn_score_dump` to support "prefill_last" mode for improved attention score management.
+    - Updated `record_pre_softmax_scores` to handle both "decode_first" and "prefill_last" modes, allowing for more flexible score recording.
+    - Enhanced NDCG metric evaluation in `compute_attn_ndcg_metrics.py` to plot per-head NDCG curves and summarize results more effectively.
+    - Modified `README.md` to reflect changes in attention parameters and training configurations.
+    - Adjusted `run_train.sh` to set a more appropriate learning rate and removed the hardcoded relative position initialization path.
+
+commit bcb1f75e7f66c658c0b3d74760e66192e7f5824b
+Author: zhzh456 <1989070006@qq.com>
+Date:   Fri Jun 5 17:42:36 2026 +0800
+
+    Refactor sparse attention for pre-RoPE cache management and evaluation
+    
+    - Updated the `_sparse_pre_softmax_scores` function to set the device for relative position bias correctly.
+    - Introduced `reset_sparse_pre_rope_key_caches` and `_wrap_generate_reset_pre_rope_cache` functions to manage pre-RoPE key caches during model generation.
+    - Modified evaluation setup to clarify the use of sparse pre-RoPE attention in the `setup_sparse_attention_for_eval` function.
+    - Cleaned up the attention forward patching logic to streamline the handling of dense and sparse attention during evaluation.
+
+commit 9c58c167b8f74e88f95afbf40de2dff7662760fd
+Author: zhzh456 <1989070006@qq.com>
+Date:   Fri Jun 5 17:05:25 2026 +0800
+
+    Enhance sparse attention mechanism with pre-RoPE key assembly
+    
+    - Updated the sparse attention implementation to include a new function `_assemble_pre_rope_keys` for constructing pre-RoPE keys.
+    - Modified the attention forward patching to utilize pre-RoPE query and key states, improving the handling of sparse scores.
+    - Revised comments and documentation to clarify the role of multiplicative factors in the attention calculations.
+
+commit 0b8e9cb2fd885f600ac461d8346d647fd4bfad86
+Author: zhzh456 <1989070006@qq.com>
+Date:   Fri Jun 5 16:51:02 2026 +0800
+
+    Add sparse attention training step and optimize CUDA memory management
+    
+    - Implemented a new `training_step` method in `SparseAttentionTrainer` to handle loss calculations and clear CUDA cache.
+    - Introduced `sparse_scores_only_forward` function in `sparse_attention.py` for distillation training, focusing on pre-softmax scores.
+    - Updated attention forward patching to utilize the new scores-only path during training.
+    - Enhanced `run_train.sh` to reduce CUDA allocator fragmentation for better performance during large backward allocations.
+
+commit 17cf22e569d8778a1990d50bf81b5cdc2ae6bc91
+Author: zhzh456 <1989070006@qq.com>
+Date:   Fri Jun 5 16:03:26 2026 +0800
+
+    1
+
+commit ac1fcc9069db89dcf8e8432ba05f02a46e5aee80
+Author: zhzh456 <1989070006@qq.com>
+Date:   Fri Jun 5 15:15:33 2026 +0800
+
+    first commit

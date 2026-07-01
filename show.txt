@@ -1,0 +1,28 @@
+五阶段推进方案
+Split into two papers
+
+https://chat.deepseek.com/share/1dmu0nz4xzgaal3reb
+
+https://chat.deepseek.com/share/zheqwgyhq105rw75vh
+Does Representation Matter? Exploring Intermediate Layers in Large Language Models
+
+配置 budget = 0.3
+根据论文内容，第一层不进行剪枝，而最后一层（以及所有其他层）都会被纳入剪枝分配的范围。
+初始化：设置最大/最小budget约束，20%预剪枝测每层掉点，精度上升层取最小budget，余层按掉点比例/最大值分配，首层保留。（离散budget，连续budget）
+搜索优化：10%→5%→1%多粒度搜索+退火。
+
+Flash Attention 评测与 Eager 校准所能接受的最大 Frame 长度存在差异。
+
+VideoNSA 
+文本token/末尾token是否保持全注意力？
+tomato 的 test split 样本数是 1484。
+目前仅针对单个数据集的特定子集完成了初步验证。
+
+
+
+（1）independent_limit128;independent_limit742;independent_limit1484。（2）若局部数据与全量数据的测试结果存在差异，通常表明模型性能受数据集分布的影响较大。
+（3）搜索耗时过长，且只拟合校准集，对总体的泛化效果未必理想。
+若对各个注意力头进行独立测试，其性能衰减幅度通常极小。
+
+（1）DepthKV （2）我们直接按比例保留每个注意力头的高分位置，并优化相应的分数比例。（3）或转而观测最终输出分布的变化情况。
+第一层不进行剪枝？

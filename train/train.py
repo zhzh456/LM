@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train per-head relative-position bias for sparse attention on Qwen3-VL (TOMATO)."""
+"""Train sparse attention parameters (budget / rel-pos) on Qwen3-VL (TOMATO)."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ from transformers import (
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train sparse-attention rel-pos bias (16K/head), backbone frozen")
+    p = argparse.ArgumentParser(description="Train sparse attention budget or rel-pos with frozen backbone")
     p.add_argument(
         "--model_path",
         type=str,
@@ -63,6 +63,12 @@ def parse_args():
     p.add_argument("--per_device_eval_batch_size", type=int, default=1)
     p.add_argument("--gradient_accumulation_steps", type=int, default=8)
     p.add_argument("--learning_rate", type=float, default=1e-3)
+    p.add_argument("--training_target", type=str, default="budget", choices=["budget", "rel_pos"])
+    p.add_argument("--loss_mode", type=str, default="task_ce", choices=["task_ce", "distill"])
+    p.add_argument("--budget_init_ratio", type=float, default=0.3)
+    p.add_argument("--budget_lambda", type=float, default=0.05)
+    p.add_argument("--budget_ste_temperature", type=float, default=0.7)
+    p.add_argument("--budget_granularity", type=str, default="layer", choices=["layer", "head"])
     p.add_argument(
         "--sparse_topk_ratio",
         type=float,
@@ -79,6 +85,18 @@ def parse_args():
         type=int,
         default=18,
         help="Text decoder layer index to train sparse rel-pos on (0-based)",
+    )
+    p.add_argument(
+        "--train_all_layers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Train on all text layers (budget mode).",
+    )
+    p.add_argument(
+        "--train_layer_ids",
+        type=str,
+        default=None,
+        help="Comma/range layer ids, e.g. '0,1,2' or '0-2'. Overrides --train_layer_id/--train_all_layers.",
     )
     p.add_argument(
         "--attn_implementation",
@@ -129,6 +147,36 @@ def _input_length_stats(inputs: dict) -> dict[str, int]:
     return {"seq_len": int(inputs["input_ids"].shape[1])}
 
 
+def _parse_layer_ids(spec: str, n_layers: int) -> list[int]:
+    out: list[int] = []
+    for part in spec.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        if "-" in p:
+            a, b = p.split("-", 1)
+            lo, hi = int(a), int(b)
+            if lo > hi:
+                lo, hi = hi, lo
+            out.extend(range(lo, hi + 1))
+        else:
+            out.append(int(p))
+    uniq = sorted(set(out))
+    if not uniq:
+        raise ValueError("train_layer_ids resolved to empty list")
+    bad = [x for x in uniq if x < 0 or x >= n_layers]
+    if bad:
+        raise ValueError(f"train_layer_ids out of range: {bad}, n_layers={n_layers}")
+    return uniq
+
+
+def _format_layer_desc(layer_ids: list[int], n_layers: int) -> str:
+    ordered = sorted(layer_ids)
+    if len(ordered) == n_layers and ordered == list(range(n_layers)):
+        return "all"
+    return ",".join(str(x) for x in ordered)
+
+
 def _format_step_log(metrics: dict) -> str:
     loss = metrics.get("loss")
     lr = metrics.get("learning_rate")
@@ -176,11 +224,13 @@ class SparseAttentionTrainer(Trainer):
         *args,
         distill_every_n_steps: int = 1,
         baseline_plain_attention: bool = False,
+        loss_mode: str = "task_ce",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.distill_every_n_steps = max(1, distill_every_n_steps)
         self.baseline_plain_attention = baseline_plain_attention
+        self.loss_mode = loss_mode
         self._micro_in_epoch = 0
         self._last_step_metrics: dict[str, float | int | bool] = {}
         # Silence default dict-style logging callbacks; keep only custom one-line print.
@@ -196,9 +246,6 @@ class SparseAttentionTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         self._micro_in_epoch += 1
-        grad_accum = max(1, self.args.gradient_accumulation_steps)
-        micro_idx = ((self._micro_in_epoch - 1) % grad_accum) + 1
-        optimizer_step = self.state.global_step + (1 if self.accelerator.sync_gradients else 0)
 
         training = model.training
         length_stats = _input_length_stats(inputs)
@@ -214,27 +261,50 @@ class SparseAttentionTrainer(Trainer):
             return (loss, outputs) if return_outputs else loss
 
         run_distill = (not training) or (self.state.global_step % self.distill_every_n_steps == 0)
-        set_run_distill_this_step(model, run_distill)
+        set_run_distill_this_step(model, run_distill and self.loss_mode == "distill")
+
+        if self.loss_mode == "task_ce":
+            outputs = model(**inputs)
+            ce_loss = outputs.loss
+            if ce_loss is None:
+                raise RuntimeError("Task CE mode expects labels and CE loss.")
+            parts = collect_sparse_distill_losses(model)
+            budget_loss = parts.get("budget")
+            budget_ratio = parts.get("ratio")
+            if budget_loss is None or budget_ratio is None:
+                raise RuntimeError("No budget tensors found; ensure training_target=budget.")
+            loss = ce_loss + budget_loss
+            self._last_step_metrics = {
+                "loss_total": float(loss.detach().item()),
+                "loss_task_ce": float(ce_loss.detach().item()),
+                "loss_budget": float(budget_loss.detach().item()),
+                "budget_ratio": float(budget_ratio.detach().item()),
+                "distill_active": False,
+                "seq_len": length_stats["seq_len"],
+            }
+            return (loss, outputs) if return_outputs else loss
 
         forward_inputs = {k: v for k, v in inputs.items() if k != "labels"}
         outputs = model(**forward_inputs)
 
         parts = collect_sparse_distill_losses(model)
-        mse_raw = parts["mse"]
-        if mse_raw is None or not run_distill:
+        loss_raw = parts["distill"]
+        if loss_raw is None:
             raise RuntimeError("No distill loss on this step; set distill_every_n_steps=1 or enable teacher forward.")
-        loss = mse_raw
-        log_dict: dict[str, float] = {
-            "loss_score_mse": float(loss.detach().item()),
-            "loss": float(loss.detach().item()),
-        }
-        log_dict["distill_active"] = int(run_distill)
+        loss = loss_raw
+        fidelity = parts.get("fidelity")
+        budget_loss = parts.get("budget")
+        budget_ratio = parts.get("ratio")
         self._last_step_metrics = {
-            "loss_total": log_dict["loss"],
-            "loss_score_mse": log_dict["loss_score_mse"],
+            "loss_total": float(loss.detach().item()),
+            "loss_score_mse": float((fidelity if fidelity is not None else loss).detach().item()),
             "distill_active": run_distill,
             "seq_len": length_stats["seq_len"],
         }
+        if budget_loss is not None:
+            self._last_step_metrics["loss_budget"] = float(budget_loss.detach().item())
+        if budget_ratio is not None:
+            self._last_step_metrics["budget_ratio"] = float(budget_ratio.detach().item())
 
         return (loss, outputs) if return_outputs else loss
 
@@ -245,6 +315,9 @@ class SparseAttentionTrainer(Trainer):
                 attn._sparse_kl_loss = None
                 attn._sparse_mse_loss = None
                 attn._sparse_distill_loss = None
+                attn._sparse_budget_loss = None
+                attn._sparse_budget_ratio = None
+                attn._sparse_fidelity_loss = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return loss
@@ -265,12 +338,18 @@ class SparseAttentionTrainer(Trainer):
         def _fmt(v: float) -> str:
             return "nan" if v != v else f"{v:.6f}"
 
+        ce = float(m.get("loss_task_ce", float("nan")))
         mse = float(m.get("loss_score_mse", float("nan")))
+        loss_budget = float(m.get("loss_budget", float("nan")))
+        budget_ratio = float(m.get("budget_ratio", float("nan")))
         distill_on = bool(m.get("distill_active", False))
         seq_len = m.get("seq_len", "na")
 
         print(
-            f"[train] step={step} epoch={epoch:.4f} seq_len={seq_len} " f"loss={_fmt(loss_total)} loss_score_mse={_fmt(mse)} " f"distill={int(distill_on)} " f"lr={float(lr):.6g} grad_norm={float(grad):.6f}",
+            f"[train] step={step} epoch={epoch:.4f} seq_len={seq_len} "
+            f"loss={_fmt(loss_total)} loss_task_ce={_fmt(ce)} loss_score_mse={_fmt(mse)} "
+            f"loss_budget={_fmt(loss_budget)} budget_ratio={_fmt(budget_ratio)} "
+            f"distill={int(distill_on)} lr={float(lr):.6g} grad_norm={float(grad):.6f}",
             flush=True,
         )
 
@@ -293,8 +372,13 @@ def main():
     args = parse_args()
     _enable_cuda_speedups()
     args.min_pixels = resolve_min_pixels(args.max_pixels, args.min_pixels)
-    mode = "baseline_plain_attention" if args.baseline_plain_attention else "position_only_training"
-    print(f"Run mode={mode} | max_pixels={args.max_pixels} min_pixels={args.min_pixels} " f"train_layer_id={args.train_layer_id} attn={args.attn_implementation} " f"distill_every_n_steps={args.distill_every_n_steps}")
+    mode = "baseline_plain_attention" if args.baseline_plain_attention else f"train_{args.training_target}"
+    print(
+        f"Run mode={mode} | max_pixels={args.max_pixels} min_pixels={args.min_pixels} "
+        f"attn={args.attn_implementation} "
+        f"distill_every_n_steps={args.distill_every_n_steps}",
+        flush=True,
+    )
     os.makedirs(args.output_dir, exist_ok=True)
 
     train_hf, eval_hf = load_tomato_split(
@@ -307,8 +391,12 @@ def main():
 
     from transformers import AutoProcessor
 
-    # Single GPU: pin to cuda:0 (clearer than "auto" on one card).
-    device_map = "cuda:0" if torch.cuda.is_available() else "cpu"
+    # Multi-process launch: pin each process to its LOCAL_RANK GPU.
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        device_map = f"cuda:{local_rank}"
+    else:
+        device_map = "cpu"
     model = Qwen3VLForConditionalGeneration.from_pretrained(
         args.model_path,
         dtype=torch.bfloat16,
@@ -331,34 +419,74 @@ def main():
     train_dataset = TomatoSFTDataset(train_hf, **common_ds_kw)
     eval_dataset = TomatoSFTDataset(eval_hf, **common_ds_kw) if eval_hf is not None and len(eval_hf) > 0 else None
 
+    n_text_layers = len(_get_language_model(model).layers)
+    if args.train_layer_ids:
+        layer_ids = _parse_layer_ids(args.train_layer_ids, n_text_layers)
+    elif args.training_target == "budget" and args.train_all_layers:
+        layer_ids = list(range(n_text_layers))
+    else:
+        layer_ids = [args.train_layer_id]
+    layer_desc = _format_layer_desc(layer_ids, n_text_layers)
+    print(f"[train] target_layers={layer_desc}", flush=True)
+
     if not args.baseline_plain_attention:
+        patch_kwargs = {}
+        if args.training_target == "budget":
+            patch_kwargs.update(
+                {
+                    "init_ratio": args.budget_init_ratio,
+                    "budget_lambda": args.budget_lambda,
+                    "ste_temperature": args.budget_ste_temperature,
+                    "budget_granularity": args.budget_granularity,
+                }
+            )
+        else:
+            patch_kwargs.update(
+                {
+                    "num_buckets": args.rel_pos_buckets,
+                    "near_tau": args.rel_pos_near_tau,
+                    "wave_period": args.rel_pos_wave_period,
+                    "wave_amp": args.rel_pos_wave_amp,
+                    "noise_std": args.rel_pos_noise_std,
+                }
+            )
+        use_distill = args.loss_mode == "distill"
         patch_model_for_sparse_training(
             model,
-            layer_id=args.train_layer_id,
-            num_buckets=args.rel_pos_buckets,
-            near_tau=args.rel_pos_near_tau,
-            wave_period=args.rel_pos_wave_period,
-            wave_amp=args.rel_pos_wave_amp,
-            noise_std=args.rel_pos_noise_std,
+            layer_ids=layer_ids,
+            training_target=args.training_target,
+            enable_early_stop=use_distill,
+            patch_causal_lm=use_distill,
+            budget_use_distill=use_distill,
+            **patch_kwargs,
         )
-        for attn in iter_attn_with_bias(model):
-            attn.sparse_topk_ratio = args.sparse_topk_ratio
 
         trainable = trainable_sparse_parameters(model)
         n_params = sum(p.numel() for p in trainable)
-        n_layers = len(list(iter_attn_with_bias(model)))
-        heads_per_layer = len(trainable) // max(n_layers, 1)
         n_text_layers = len(_get_language_model(model).layers)
-        print(
-            f"Trainable: layer {args.train_layer_id} x {heads_per_layer} heads " f"= {len(trainable)} vectors x {args.rel_pos_buckets} dims, {n_params:,} total",
-            flush=True,
-        )
-        if args.train_layer_id + 1 < n_text_layers:
+        if args.training_target == "budget":
+            granularity = args.budget_granularity
             print(
-                f"[sparse] early-stop text decoder at layer {args.train_layer_id} " f"(skip layers {args.train_layer_id + 1}-{n_text_layers - 1}, no lm_head)",
+                f"Trainable: layers={layer_desc} budget({granularity}) x {len(trainable)} tensors ({n_params:,} params) "
+                f"| init_ratio={args.budget_init_ratio} lambda={args.budget_lambda} ste_temp={args.budget_ste_temperature}",
                 flush=True,
             )
-        if args.rel_pos_init_path:
+        else:
+            n_layers = len(list(iter_attn_with_bias(model)))
+            heads_per_layer = len(trainable) // max(n_layers, 1)
+            print(
+                f"Trainable: layer {args.train_layer_id} x {heads_per_layer} heads "
+                f"= {len(trainable)} vectors x {args.rel_pos_buckets} dims, {n_params:,} total",
+                flush=True,
+            )
+        last_sparse_layer = max(layer_ids)
+        if use_distill and last_sparse_layer + 1 < n_text_layers:
+            print(
+                f"[sparse] early-stop text decoder at layer {last_sparse_layer} "
+                f"(skip layers {last_sparse_layer + 1}-{n_text_layers - 1}, no lm_head)",
+                flush=True,
+            )
+        if args.training_target == "rel_pos" and args.rel_pos_init_path:
             n_loaded = load_sparse_rel_pos_checkpoint(
                 model,
                 args.rel_pos_init_path,
@@ -368,18 +496,19 @@ def main():
                 f"[init] loaded {n_loaded} head vectors from {args.rel_pos_init_path} " f"(train_layer_id={args.train_layer_id})",
                 flush=True,
             )
-        else:
+        elif args.training_target == "rel_pos":
             print(
                 f"[init] default near_tau={args.rel_pos_near_tau} " f"wave_period={args.rel_pos_wave_period} wave_amp={args.rel_pos_wave_amp}",
                 flush=True,
             )
 
-    steps_per_epoch = max(
-        1,
-        (len(train_dataset) + args.per_device_train_batch_size * args.gradient_accumulation_steps - 1) // (args.per_device_train_batch_size * args.gradient_accumulation_steps),
-    )
+    world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+    effective_batch = max(1, args.per_device_train_batch_size * args.gradient_accumulation_steps * world_size)
+    steps_per_epoch = max(1, (len(train_dataset) + effective_batch - 1) // effective_batch)
     print(
-        f"Dataset: train={len(train_dataset)} eval={len(eval_dataset) if eval_dataset else 0} | " f"~{steps_per_epoch} optimizer step(s)/epoch " f"(batch={args.per_device_train_batch_size} grad_accum={args.gradient_accumulation_steps})",
+        f"Dataset: train={len(train_dataset)} eval={len(eval_dataset) if eval_dataset else 0} | "
+        f"~{steps_per_epoch} optimizer step(s)/epoch "
+        f"(batch={args.per_device_train_batch_size} grad_accum={args.gradient_accumulation_steps} world_size={world_size})",
         flush=True,
     )
 
@@ -431,6 +560,7 @@ def main():
         callbacks=[ConsoleLossCallback(), SavePathCallback(model)],
         distill_every_n_steps=args.distill_every_n_steps,
         baseline_plain_attention=args.baseline_plain_attention,
+        loss_mode=args.loss_mode,
     )
 
     if args.baseline_plain_attention:

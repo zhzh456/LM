@@ -7,12 +7,14 @@ from typing import Iterable, List
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 SPARSE_REL_POS_FILENAME = "sparse_rel_pos_bias.pt"
 SPARSE_CKPT_META_KEY = "_meta"
 
 from sparse_attention import (
     PerHeadRelativePositionBias,
+    _forward_attend_pair_mask,
     attention_scores_distillation_loss,
     dense_eager_attention_forward,
     full_qk_eager_attention_forward,
@@ -145,8 +147,145 @@ def attach_sparse_attention_modules(
     raise ValueError(f"layer_id={layer_id} out of range (num_text_layers={n_layers})")
 
 
+def attach_sparse_budget_module(
+    model: nn.Module,
+    *,
+    layer_ids: list[int] | None = None,
+    budget_granularity: str = "layer",
+    init_ratio: float = 0.3,
+    budget_lambda: float = 0.05,
+    ste_temperature: float = 0.7,
+    min_ratio: float = 0.01,
+    max_ratio: float = 1.0,
+) -> List[nn.Parameter]:
+    """Register trainable budget ratio on selected text attention layers."""
+    trainable: List[nn.Parameter] = []
+    init = float(min(max(init_ratio, min_ratio), max_ratio))
+    eps = 1e-4
+    init = min(max(init, eps), 1.0 - eps)
+    logit = torch.logit(torch.tensor(init, dtype=torch.float32))
+    all_attn = list(_iter_text_attention_modules(model))
+    n_layers = len(all_attn)
+    if layer_ids is None:
+        target = set(range(n_layers))
+    else:
+        target = {int(x) for x in layer_ids}
+    if not target:
+        raise ValueError("No layer selected for budget training")
+    bad = [x for x in sorted(target) if x < 0 or x >= n_layers]
+    if bad:
+        raise ValueError(f"layer_ids out of range: {bad}, num_text_layers={n_layers}")
+
+    for layer_idx, attn in enumerate(_iter_text_attention_modules(model)):
+        if layer_idx not in target:
+            continue
+        if budget_granularity == "head":
+            n_heads = int(getattr(attn, "num_heads", attn.config.num_attention_heads))
+            p = nn.Parameter(logit.repeat(n_heads))
+        elif budget_granularity == "layer":
+            p = nn.Parameter(logit.clone())
+        else:
+            raise ValueError(f"Unsupported budget_granularity={budget_granularity}")
+        attn.register_parameter("sparse_budget_logit", p)
+        attn.sparse_budget_lambda = float(max(0.0, budget_lambda))
+        attn.sparse_budget_ste_temperature = float(max(1e-4, ste_temperature))
+        attn.sparse_budget_min_ratio = float(min_ratio)
+        attn.sparse_budget_max_ratio = float(max_ratio)
+        attn.sparse_budget_use_distill = True
+        attn.use_sparse_attention = True
+        attn.train_sparse_budget = True
+        attn.sparse_budget_granularity = budget_granularity
+        attn._sparse_distill_loss = None
+        attn._sparse_layer_idx = layer_idx
+        p.requires_grad = True
+        trainable.append(p)
+    return trainable
+
+
 def _get_stacked_rel_pos_bias(attn: nn.Module) -> torch.Tensor:
     return attn.rel_pos_bias_per_head.stacked()
+
+
+def _get_budget_ratio_tensor(attn: nn.Module, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    logit = getattr(attn, "sparse_budget_logit", None)
+    if logit is None:
+        ratio = float(getattr(attn, "sparse_topk_ratio", 0.2))
+        return torch.tensor(ratio, device=device, dtype=dtype)
+    lo = float(getattr(attn, "sparse_budget_min_ratio", 0.01))
+    hi = float(getattr(attn, "sparse_budget_max_ratio", 1.0))
+    ratio = torch.sigmoid(logit).to(device=device, dtype=dtype)
+    ratio = ratio * (hi - lo) + lo
+    return ratio.clamp(min=lo, max=hi)
+
+
+def _budget_topk_attention_forward_ste(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    *,
+    budget_ratio: torch.Tensor,
+    ste_temperature: float,
+    dropout: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Hard top-k by explicit attention scores for forward, STE-lite surrogate for backward.
+    `ste_temperature` scales surrogate gradient strength (lower -> stronger).
+    """
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import repeat_kv
+
+    batch_size = query.size(0)
+    n_heads = query.size(1)
+    q_len = query.size(-2)
+    kv_len = key.size(-2)
+    neg_inf = torch.finfo(query.dtype).min
+
+    attn_scores = qk_pre_softmax_scores(module, query, key, attention_mask, scaling)
+    valid = _forward_attend_pair_mask(
+        attention_mask,
+        batch_size=batch_size,
+        n_heads=n_heads,
+        q_len=q_len,
+        kv_len=kv_len,
+        device=attn_scores.device,
+    )
+
+    if budget_ratio.dim() == 0:
+        ratio_bhq1 = budget_ratio.view(1, 1, 1, 1)
+    elif budget_ratio.dim() == 1 and budget_ratio.numel() == n_heads:
+        ratio_bhq1 = budget_ratio.view(1, n_heads, 1, 1)
+    else:
+        raise ValueError(f"Invalid budget_ratio shape {tuple(budget_ratio.shape)} for n_heads={n_heads}")
+
+    masked = attn_scores.masked_fill(~valid, neg_inf)
+    n_valid = valid.sum(dim=-1, keepdim=True).clamp(min=1)
+    k_keep = torch.ceil(n_valid.float() * ratio_bhq1.float()).long().clamp(min=1)
+    max_k = int(k_keep.max().item())
+    _, idx = torch.topk(masked, max_k, dim=-1)
+    ranks = torch.arange(max_k, device=attn_scores.device).view(1, 1, 1, -1)
+    in_topk = ranks < k_keep
+    keep_hard = torch.zeros_like(valid)
+    keep_hard.scatter_(dim=-1, index=idx, src=in_topk)
+    keep_hard = keep_hard & valid
+
+    scores_hard = attn_scores.masked_fill(~keep_hard, neg_inf)
+    weights_hard = F.softmax(scores_hard.float(), dim=-1).to(query.dtype)
+
+    # STE-lite surrogate: keep hard top-k forward path, provide ratio gradient
+    # without materializing extra full (B,H,Q,K) softmax tensors.
+    # Temperature only rescales surrogate gradient (no forward-path change).
+    ste_temp = max(float(ste_temperature), 1e-4)
+    ste_gain = min(1.0 / ste_temp, 8.0)  # guard against extreme gradients
+    ratio_delta = ratio_bhq1.to(query.dtype) - ratio_bhq1.to(query.dtype).detach()
+    attn_weights = weights_hard + (weights_hard * ratio_delta * ste_gain)
+    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
+
+    value_states = repeat_kv(value, module.num_key_value_groups).to(query.device)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, weights_hard, attn_scores
 
 
 def reset_sparse_pre_rope_key_caches(model: nn.Module) -> None:
@@ -249,53 +388,91 @@ def _patch_attention_forward(attn: nn.Module) -> None:
         else:
             key_pre_rope = key_pre_rope_step
 
-        rel_bias = _get_stacked_rel_pos_bias(self)
-
         run_distill = getattr(self, "_run_distill_this_step", True)
         sparse_train_layer = getattr(self, "use_sparse_attention", False) and not getattr(self, "sparse_decode_only", False)
         if sparse_train_layer:
             self._sparse_kl_loss = None
             self._sparse_mse_loss = None
             self._sparse_distill_loss = None
-            if self.training:
-                sparse_out, _, distill = sparse_scores_only_forward(
+            if getattr(self, "train_sparse_budget", False):
+                ratio = _get_budget_ratio_tensor(self, device=query_states.device, dtype=query_states.dtype)
+                dropout = 0.0 if not self.training else self.attention_dropout
+                sparse_out, _, _ = _budget_topk_attention_forward_ste(
                     self,
-                    query_pre_rope,
-                    key_pre_rope,
-                    attention_mask,
-                    self.scaling,
-                    rel_pos_bias=rel_bias,
-                )
-            else:
-                sparse_out, _, distill = sparse_eager_attention_forward(
-                    self,
-                    query_pre_rope,
-                    key_pre_rope,
+                    query_states,
+                    key_states,
                     value_states,
                     attention_mask,
                     self.scaling,
-                    dropout=0.0 if not self.training else self.attention_dropout,
-                    rel_pos_bias=rel_bias,
-                    return_distill_tensors=True,
+                    budget_ratio=ratio,
+                    ste_temperature=float(getattr(self, "sparse_budget_ste_temperature", 0.7)),
+                    dropout=dropout,
                 )
-            if run_distill:
-                sparse_scores = distill["attn_scores"]
-                with torch.no_grad():
-                    full_scores = qk_pre_softmax_scores(
+                loss_budget = ratio.mean() * float(getattr(self, "sparse_budget_lambda", 0.05))
+                self._sparse_budget_loss = loss_budget
+                self._sparse_budget_ratio = ratio.mean()
+                self._sparse_budget_ratio_per_head = ratio.detach() if ratio.dim() > 0 else ratio.detach().view(1)
+                self._sparse_kl_loss = None
+                if getattr(self, "sparse_budget_use_distill", True):
+                    with torch.no_grad():
+                        teacher_out, _ = full_qk_eager_attention_forward(
+                            self,
+                            query_states,
+                            key_states,
+                            value_states,
+                            attention_mask,
+                            self.scaling,
+                        )
+                    loss_fidelity = F.mse_loss(sparse_out.float(), teacher_out.float().detach()).to(sparse_out.dtype)
+                    loss_out = loss_fidelity + loss_budget
+                    self._sparse_mse_loss = loss_fidelity
+                    self._sparse_distill_loss = loss_out
+                    self._sparse_fidelity_loss = loss_fidelity
+                else:
+                    self._sparse_mse_loss = None
+                    self._sparse_distill_loss = None
+                    self._sparse_fidelity_loss = None
+            else:
+                rel_bias = _get_stacked_rel_pos_bias(self)
+                if self.training:
+                    sparse_out, _, distill = sparse_scores_only_forward(
                         self,
-                        query_states,
-                        key_states,
+                        query_pre_rope,
+                        key_pre_rope,
                         attention_mask,
                         self.scaling,
+                        rel_pos_bias=rel_bias,
                     )
-                loss_out = attention_scores_distillation_loss(full_scores, sparse_scores, attention_mask)
-                self._sparse_kl_loss = None
-                self._sparse_mse_loss = loss_out
-                self._sparse_distill_loss = loss_out
-            else:
-                self._sparse_kl_loss = None
-                self._sparse_mse_loss = None
-                self._sparse_distill_loss = None
+                else:
+                    sparse_out, _, distill = sparse_eager_attention_forward(
+                        self,
+                        query_pre_rope,
+                        key_pre_rope,
+                        value_states,
+                        attention_mask,
+                        self.scaling,
+                        dropout=0.0 if not self.training else self.attention_dropout,
+                        rel_pos_bias=rel_bias,
+                        return_distill_tensors=True,
+                    )
+                if run_distill:
+                    sparse_scores = distill["attn_scores"]
+                    with torch.no_grad():
+                        full_scores = qk_pre_softmax_scores(
+                            self,
+                            query_states,
+                            key_states,
+                            attention_mask,
+                            self.scaling,
+                        )
+                    loss_out = attention_scores_distillation_loss(full_scores, sparse_scores, attention_mask)
+                    self._sparse_kl_loss = None
+                    self._sparse_mse_loss = loss_out
+                    self._sparse_distill_loss = loss_out
+                else:
+                    self._sparse_kl_loss = None
+                    self._sparse_mse_loss = None
+                    self._sparse_distill_loss = None
             attn_output = sparse_out
         else:
             # Eval: prefill = sparse pre-softmax f(d)*Q_pre*K_pre/sqrt(d); decode = full RoPE QK.
@@ -312,6 +489,7 @@ def _patch_attention_forward(attn: nn.Module) -> None:
                     dropout=dropout,
                 )
             else:
+                rel_bias = _get_stacked_rel_pos_bias(self)
                 attn_output, _ = dense_eager_attention_forward(
                     self,
                     query_pre_rope,
@@ -325,6 +503,11 @@ def _patch_attention_forward(attn: nn.Module) -> None:
             self._sparse_distill_loss = None
             self._sparse_kl_loss = None
             self._sparse_mse_loss = None
+        if not sparse_train_layer:
+            self._sparse_budget_loss = None
+            self._sparse_budget_ratio = None
+            self._sparse_budget_ratio_per_head = None
+            self._sparse_fidelity_loss = None
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -337,19 +520,43 @@ def _patch_attention_forward(attn: nn.Module) -> None:
 def patch_model_for_sparse_training(
     model: nn.Module,
     *,
-    layer_id: int = 18,
+    layer_ids: list[int] | None = None,
+    training_target: str = "budget",
+    enable_early_stop: bool = True,
+    patch_causal_lm: bool = True,
+    budget_use_distill: bool = True,
     **attach_kwargs,
 ) -> List[nn.Parameter]:
-    """Freeze backbone; train sparse rel-pos on one text layer only."""
+    """Freeze backbone; train sparse params on one text layer only."""
     freeze_backbone(model)
-    trainable = attach_sparse_attention_modules(model, layer_id=layer_id, **attach_kwargs)
+    all_attn = list(_iter_text_attention_modules(model))
+    n_layers = len(all_attn)
+    if layer_ids is None:
+        target = set(range(n_layers))
+    else:
+        target = {int(x) for x in layer_ids}
+    if not target:
+        raise ValueError("No layer selected for sparse training")
+    if training_target == "budget":
+        trainable = attach_sparse_budget_module(model, layer_ids=sorted(target), **attach_kwargs)
+    elif training_target == "rel_pos":
+        if len(target) != 1:
+            raise ValueError("rel_pos training supports exactly one layer")
+        layer_id = sorted(target)[0]
+        trainable = attach_sparse_attention_modules(model, layer_id=layer_id, **attach_kwargs)
+    else:
+        raise ValueError(f"Unsupported training_target={training_target}")
     for layer_idx, attn in enumerate(_iter_text_attention_modules(model)):
-        if layer_idx != layer_id:
+        if layer_idx not in target:
             continue
         attn.sparse_decode_only = False
+        if training_target == "budget":
+            attn.sparse_budget_use_distill = bool(budget_use_distill)
         _patch_attention_forward(attn)
-    _patch_text_model_early_stop(_get_language_model(model), layer_id)
-    _patch_causal_lm_sparse_forward(model)
+    if enable_early_stop:
+        _patch_text_model_early_stop(_get_language_model(model), max(target))
+    if patch_causal_lm:
+        _patch_causal_lm_sparse_forward(model)
     return trainable
 
 
@@ -376,26 +583,60 @@ def collect_sparse_distill_loss(model: nn.Module) -> torch.Tensor | None:
 
 
 def collect_sparse_distill_losses(model: nn.Module) -> dict[str, torch.Tensor | None]:
-    kl_total = mse_total = distill_total = None
-    n_kl = n_mse = 0
+    kl_total = mse_total = distill_total = direct_total = None
+    budget_total = fidelity_total = ratio_total = None
+    n_kl = n_mse = n_direct = 0
+    n_budget = n_fidelity = n_ratio = 0
     for attn in _iter_text_attention_modules(model):
         if not getattr(attn, "use_sparse_attention", False):
             continue
         kl = getattr(attn, "_sparse_kl_loss", None)
         mse = getattr(attn, "_sparse_mse_loss", None)
+        direct = getattr(attn, "_sparse_distill_loss", None)
+        budget = getattr(attn, "_sparse_budget_loss", None)
+        fidelity = getattr(attn, "_sparse_fidelity_loss", None)
+        ratio = getattr(attn, "_sparse_budget_ratio", None)
         if kl is not None:
             kl_total = kl if kl_total is None else kl_total + kl
             n_kl += 1
         if mse is not None:
             mse_total = mse if mse_total is None else mse_total + mse
             n_mse += 1
+        if direct is not None:
+            direct_total = direct if direct_total is None else direct_total + direct
+            n_direct += 1
+        if budget is not None:
+            budget_total = budget if budget_total is None else budget_total + budget
+            n_budget += 1
+        if fidelity is not None:
+            fidelity_total = fidelity if fidelity_total is None else fidelity_total + fidelity
+            n_fidelity += 1
+        if ratio is not None:
+            ratio_total = ratio if ratio_total is None else ratio_total + ratio
+            n_ratio += 1
     if kl_total is not None and n_kl > 0:
         kl_total = kl_total / n_kl
         distill_total = kl_total
     if mse_total is not None and n_mse > 0:
         mse_total = mse_total / n_mse
         distill_total = mse_total if distill_total is None else distill_total + mse_total
-    return {"kl": kl_total, "mse": mse_total, "distill": distill_total}
+    if direct_total is not None and n_direct > 0:
+        direct_total = direct_total / n_direct
+        distill_total = direct_total
+    if budget_total is not None and n_budget > 0:
+        budget_total = budget_total / n_budget
+    if fidelity_total is not None and n_fidelity > 0:
+        fidelity_total = fidelity_total / n_fidelity
+    if ratio_total is not None and n_ratio > 0:
+        ratio_total = ratio_total / n_ratio
+    return {
+        "kl": kl_total,
+        "mse": mse_total,
+        "distill": distill_total,
+        "budget": budget_total,
+        "fidelity": fidelity_total,
+        "ratio": ratio_total,
+    }
 
 
 def trainable_sparse_parameters(model: nn.Module) -> List[nn.Parameter]:
@@ -404,7 +645,7 @@ def trainable_sparse_parameters(model: nn.Module) -> List[nn.Parameter]:
 
 def iter_attn_with_bias(model: nn.Module) -> Iterable[nn.Module]:
     for attn in _iter_text_attention_modules(model):
-        if hasattr(attn, "rel_pos_bias_per_head"):
+        if hasattr(attn, "rel_pos_bias_per_head") or hasattr(attn, "sparse_budget_logit"):
             yield attn
 
 
@@ -436,7 +677,7 @@ def unpack_sparse_rel_pos_checkpoint(
 
 
 def save_sparse_rel_pos_checkpoint(model: nn.Module, output_dir: str) -> str:
-    """Save single-layer rel-pos weights + metadata to sparse_rel_pos_bias.pt."""
+    """Save sparse training weights (rel-pos and/or budget) to sparse_rel_pos_bias.pt."""
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, SPARSE_REL_POS_FILENAME)
     attns = list(iter_attn_with_bias(model))
@@ -447,15 +688,24 @@ def save_sparse_rel_pos_checkpoint(model: nn.Module, output_dir: str) -> str:
     layer_ids: list[int] = []
     rel_pos_buckets = None
     num_heads = None
+    has_budget = False
+    has_rel_pos = False
     for attn in attns:
         layer_idx = int(getattr(attn, "_sparse_layer_idx", 0))
         layer_ids.append(layer_idx)
-        mod = attn.rel_pos_bias_per_head
-        rel_pos_buckets = mod.num_buckets
-        num_heads = mod.num_heads
-        for h, p in enumerate(mod.head_biases):
-            tensors[f"layer_{layer_idx}.head_{h}"] = p.detach().cpu()
-        tensors[f"layer_{layer_idx}.sparse_topk_ratio"] = torch.tensor(getattr(attn, "sparse_topk_ratio", 0.2))
+        if hasattr(attn, "rel_pos_bias_per_head"):
+            mod = attn.rel_pos_bias_per_head
+            has_rel_pos = True
+            rel_pos_buckets = mod.num_buckets
+            num_heads = mod.num_heads
+            for h, p in enumerate(mod.head_biases):
+                tensors[f"layer_{layer_idx}.head_{h}"] = p.detach().cpu()
+            tensors[f"layer_{layer_idx}.sparse_topk_ratio"] = torch.tensor(getattr(attn, "sparse_topk_ratio", 0.2))
+        if hasattr(attn, "sparse_budget_logit"):
+            has_budget = True
+            ratio = _get_budget_ratio_tensor(attn, device=attn.sparse_budget_logit.device, dtype=attn.sparse_budget_logit.dtype)
+            tensors[f"layer_{layer_idx}.sparse_budget_logit"] = attn.sparse_budget_logit.detach().cpu()
+            tensors[f"layer_{layer_idx}.sparse_budget_ratio"] = ratio.detach().cpu()
 
     meta = {
         "format_version": 1,
@@ -463,6 +713,8 @@ def save_sparse_rel_pos_checkpoint(model: nn.Module, output_dir: str) -> str:
         "rel_pos_buckets": rel_pos_buckets,
         "num_heads": num_heads,
         "num_sparse_layers": len(layer_ids),
+        "has_rel_pos": has_rel_pos,
+        "has_budget": has_budget,
     }
     payload = {SPARSE_CKPT_META_KEY: meta, **tensors}
     torch.save(payload, path)
@@ -472,10 +724,7 @@ def save_sparse_rel_pos_checkpoint(model: nn.Module, output_dir: str) -> str:
     if alias != path:
         torch.save(payload, alias)
 
-    print(
-        f"[save] sparse rel-pos layer={layer_tag} heads={num_heads} " f"buckets={rel_pos_buckets} -> {path}",
-        flush=True,
-    )
+    print(f"[save] sparse params layer={layer_tag} rel_pos={has_rel_pos} budget={has_budget} -> {path}", flush=True)
     return path
 
 
@@ -504,11 +753,18 @@ def load_sparse_rel_pos_checkpoint(
         layer_idx = int(getattr(attn, "_sparse_layer_idx", 0))
         if expected_layer_id is not None and layer_idx != expected_layer_id:
             continue
-        for h, p in enumerate(attn.rel_pos_bias_per_head.head_biases):
-            key = f"layer_{layer_idx}.head_{h}"
-            if key not in tensors:
-                continue
-            vec = _resize_rel_pos_vector(tensors[key], p.numel()).to(device=p.device, dtype=p.dtype)
-            p.data.copy_(vec)
-            loaded += 1
+        if hasattr(attn, "rel_pos_bias_per_head"):
+            for h, p in enumerate(attn.rel_pos_bias_per_head.head_biases):
+                key = f"layer_{layer_idx}.head_{h}"
+                if key not in tensors:
+                    continue
+                vec = _resize_rel_pos_vector(tensors[key], p.numel()).to(device=p.device, dtype=p.dtype)
+                p.data.copy_(vec)
+                loaded += 1
+        if hasattr(attn, "sparse_budget_logit"):
+            key = f"layer_{layer_idx}.sparse_budget_logit"
+            if key in tensors:
+                v = tensors[key].to(device=attn.sparse_budget_logit.device, dtype=attn.sparse_budget_logit.dtype)
+                attn.sparse_budget_logit.data.copy_(v.reshape_as(attn.sparse_budget_logit))
+                loaded += 1
     return loaded

@@ -134,7 +134,16 @@ def _ratio_key(ratio: float) -> str:
     return f"{ratio:.1f}"
 
 
-def run_eval(lm, hf_model, tasks: list[str], limit: int | None, batch_size: int) -> dict[str, Any]:
+def _is_main_process(lm) -> bool:
+    return int(getattr(lm, "rank", 0)) == 0
+
+
+def _log(lm, msg: str) -> None:
+    if _is_main_process(lm):
+        print(msg, flush=True)
+
+
+def run_eval(lm, hf_model, tasks: list[str], limit: int | None, batch_size: int) -> dict[str, Any] | None:
     """Run lmms_eval; restore lm._model after clean() deletes nn.Module attrs."""
     from lmms_eval import evaluator
 
@@ -377,6 +386,7 @@ def main() -> None:
         interleave_visuals=False,
     )
     hf_model = lm._model
+    _log(lm, f"[step1] world_size={getattr(lm, 'world_size', 1)} rank={getattr(lm, 'rank', 0)}")
 
     n_layers = num_text_layers(hf_model)
     layer_ids = parse_layer_list(args.layers, n_layers)
@@ -396,6 +406,7 @@ def main() -> None:
             "layers_profiled": layer_ids,
             "ratios": ratios,
             "sparsity": "post_rope_qk_topk_prefill_only",
+            "num_gpus": int(getattr(lm, "world_size", 1)),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         },
         "layers": {},
@@ -405,55 +416,66 @@ def main() -> None:
 
     acc_full: float | None = None
     if args.measure_acc_full:
-        print("[step1] measuring Acc_full (all layers dense)", flush=True)
+        _log(lm, "[step1] measuring Acc_full (all layers dense)")
         clear_post_rope_topk_layers(hf_model)
         full_results = run_eval(lm, hf_model, tasks, args.limit, args.batch_size)
-        acc_full = extract_metric(full_results, primary_task, metric)
-        if acc_full is None:
-            raise RuntimeError(f"metric {metric!r} not found in results: {full_results.get('results', {})}")
-        store["acc_full"] = acc_full
-        save_results(results_path, store)
-        print(f"[step1] Acc_full = {acc_full:.6f}", flush=True)
+        if _is_main_process(lm):
+            if full_results is None:
+                raise RuntimeError("Acc_full eval returned no results on rank 0")
+            acc_full = extract_metric(full_results, primary_task, metric)
+            if acc_full is None:
+                raise RuntimeError(f"metric {metric!r} not found in results: {full_results.get('results', {})}")
+            store["acc_full"] = acc_full
+            save_results(results_path, store)
+            _log(lm, f"[step1] Acc_full = {acc_full:.6f}")
 
     if args.all:
         all_entry = store["all"]
         for ratio in ratios:
             if ratio >= 1.0 and acc_full is not None:
-                acc = acc_full
-                print(f"[step1] all layers r={ratio:.1f} -> Acc={acc:.6f} (dense)", flush=True)
+                if _is_main_process(lm):
+                    acc = acc_full
+                    _log(lm, f"[step1] all layers r={ratio:.1f} -> Acc={acc:.6f} (dense)")
             else:
                 clear_post_rope_topk_layers(hf_model)
                 install_post_rope_topk_uniform_layers(hf_model, layer_ids=layer_ids, ratio=ratio)
                 layer_desc = f"{layer_ids[0]}-{layer_ids[-1]}" if len(layer_ids) > 1 else str(layer_ids[0])
-                print(
+                _log(
+                    lm,
                     f"[step1] eval ALL layers [{layer_desc}] n={len(layer_ids)} "
                     f"r={ratio:.1f} (post-RoPE top-k prefill)",
-                    flush=True,
                 )
                 eval_results = run_eval(lm, hf_model, tasks, args.limit, args.batch_size)
-                acc = extract_metric(eval_results, primary_task, metric)
-                if acc is None:
-                    raise RuntimeError(
-                        f"metric {metric!r} missing for all_layers r={ratio}: "
-                        f"{eval_results.get('results', {})}"
-                    )
-                print(f"[step1] all layers r={ratio:.1f} -> Acc={acc:.6f}", flush=True)
+                if _is_main_process(lm):
+                    if eval_results is None:
+                        raise RuntimeError(f"eval returned no results on rank 0 for all_layers r={ratio}")
+                    acc = extract_metric(eval_results, primary_task, metric)
+                    if acc is None:
+                        raise RuntimeError(
+                            f"metric {metric!r} missing for all_layers r={ratio}: "
+                            f"{eval_results.get('results', {})}"
+                        )
+                    _log(lm, f"[step1] all layers r={ratio:.1f} -> Acc={acc:.6f}")
 
-            ratio_key = _ratio_key(ratio)
-            all_entry["acc_by_ratio"][ratio_key] = acc
-            if acc_full is not None:
-                all_entry["drop_by_ratio"][ratio_key] = acc_full - acc
-            store["all"] = all_entry
-            save_results(results_path, store)
+            if _is_main_process(lm):
+                ratio_key = _ratio_key(ratio)
+                all_entry["acc_by_ratio"][ratio_key] = acc
+                if acc_full is not None:
+                    all_entry["drop_by_ratio"][ratio_key] = acc_full - acc
+                store["all"] = all_entry
+                save_results(results_path, store)
 
         clear_post_rope_topk_layers(hf_model)
-        finalize_all_layers_outputs(
-            store,
-            output_dir,
-            ratios=ratios,
-            acc_full=acc_full,
-            results_path=results_path,
-        )
+        if _is_main_process(lm):
+            finalize_all_layers_outputs(
+                store,
+                output_dir,
+                ratios=ratios,
+                acc_full=acc_full,
+                results_path=results_path,
+            )
+        if hasattr(lm, "accelerator"):
+            lm.accelerator.wait_for_everyone()
         return
 
     for layer_id in layer_ids:
@@ -464,38 +486,46 @@ def main() -> None:
         )
         for ratio in ratios:
             if ratio >= 1.0 and acc_full is not None:
-                acc = acc_full
-                print(f"[step1] layer={layer_id} r={ratio:.1f} -> Acc={acc:.6f} (dense)", flush=True)
+                if _is_main_process(lm):
+                    acc = acc_full
+                    _log(lm, f"[step1] layer={layer_id} r={ratio:.1f} -> Acc={acc:.6f} (dense)")
             else:
                 clear_post_rope_topk_layers(hf_model)
                 set_post_rope_topk_single_layer(hf_model, layer_id=layer_id, ratio=ratio)
-                print(f"[step1] eval layer={layer_id} r={ratio:.1f} (post-RoPE top-k)", flush=True)
+                _log(lm, f"[step1] eval layer={layer_id} r={ratio:.1f} (post-RoPE top-k)")
                 eval_results = run_eval(lm, hf_model, tasks, args.limit, args.batch_size)
-                acc = extract_metric(eval_results, primary_task, metric)
-                if acc is None:
-                    raise RuntimeError(
-                        f"metric {metric!r} missing for layer={layer_id} r={ratio}: "
-                        f"{eval_results.get('results', {})}"
-                    )
-                print(f"[step1] layer={layer_id} r={ratio:.1f} -> Acc={acc:.6f}", flush=True)
+                if _is_main_process(lm):
+                    if eval_results is None:
+                        raise RuntimeError(f"eval returned no results on rank 0 for layer={layer_id} r={ratio}")
+                    acc = extract_metric(eval_results, primary_task, metric)
+                    if acc is None:
+                        raise RuntimeError(
+                            f"metric {metric!r} missing for layer={layer_id} r={ratio}: "
+                            f"{eval_results.get('results', {})}"
+                        )
+                    _log(lm, f"[step1] layer={layer_id} r={ratio:.1f} -> Acc={acc:.6f}")
 
-            ratio_key = _ratio_key(ratio)
-            layer_entry["acc_by_ratio"][ratio_key] = acc
-            if acc_full is not None:
-                layer_entry["drop_by_ratio"][ratio_key] = acc_full - acc
-            store["layers"][layer_key] = layer_entry
-            save_results(results_path, store)
+            if _is_main_process(lm):
+                ratio_key = _ratio_key(ratio)
+                layer_entry["acc_by_ratio"][ratio_key] = acc
+                if acc_full is not None:
+                    layer_entry["drop_by_ratio"][ratio_key] = acc_full - acc
+                store["layers"][layer_key] = layer_entry
+                save_results(results_path, store)
 
         clear_post_rope_topk_layers(hf_model)
 
-    finalize_step1_outputs(
-        store,
-        output_dir,
-        layer_ids=layer_ids,
-        ratios=ratios,
-        acc_full=acc_full,
-        results_path=results_path,
-    )
+    if _is_main_process(lm):
+        finalize_step1_outputs(
+            store,
+            output_dir,
+            layer_ids=layer_ids,
+            ratios=ratios,
+            acc_full=acc_full,
+            results_path=results_path,
+        )
+    if hasattr(lm, "accelerator"):
+        lm.accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":

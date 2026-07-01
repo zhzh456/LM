@@ -128,6 +128,8 @@ bash examples/models/qwen3vl_sparse_attn.sh
 
 （或者多种组合方式？）
 
+
+
 ---
 
 ## Version 4
@@ -139,3 +141,13 @@ bash examples/models/qwen3vl_sparse_attn.sh
 3. 多模态评测：**prefill 用稀疏 pre-softmax**，**decode 用全量 RoPE QK**。
 
 4. 先在 layer 35 上把训练方式定下来（公式、init、lr、prefill/decode 分工与评测采集），再按同样流程训练其他层。
+
+## Version 5
+
+在 all 模式下，候选项的距离数量分布存在不均衡现象。例如，距离为 0 的候选项数量最多。针对这种情况，应采用 last 策略，还是通过多次 decode 来处理？
+
+1. 先进行 prefill 验证，后续再进入 decode 阶段。
+
+2. 调整不同 layer 和 head 的权衡比例。
+
+3. 部分 token 在使用 distance 选择前序 token 时，会出现索引越界的问题。可以尝试强制选择不越界的 distance 索引，观察是否有效；如果效果不明显，这类情况也可以考虑不使用 distance 选择。

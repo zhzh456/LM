@@ -1,0 +1,6 @@
+# example_input: (2, 4)
+
+placeholder    x        x                                (2, 4)
+call_module    fc       fc                               (2, 4)
+call_function  relu     <built-in method relu of type object at 0x7fef17c2bf60> (2, 4)
+output         output   output                           (2, 4)

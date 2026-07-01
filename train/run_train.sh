@@ -5,7 +5,8 @@ export http_proxy=http://10.229.18.27:8412
 export https_proxy=http://10.229.18.27:8412
 export HTTP_PROXY=http://10.229.18.27:8412
 export HTTPS_PROXY=http://10.229.18.27:8412
-export CUDA_VISIBLE_DEVICES=0
+NUM_GPUS="${NUM_GPUS:-4}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 # Reduce CUDA allocator fragmentation (helps large contiguous backward allocs).
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
@@ -19,10 +20,23 @@ if [[ -n "${RESUME_FROM_CHECKPOINT:-}" && -d "${RESUME_FROM_CHECKPOINT}" ]]; the
   RESUME_ARGS=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
 
-# max_pixels=12845056 (video clips to 786432/frame, seq~6K). Distill uses scores-only path.
-# rel_pos: default prior init (exp decay + wave); lr=0.1, 0.25 epoch.
-# checkpoint every 0.25 epoch -> checkpoint-{step}/sparse_rel_pos_bias.pt
-accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
+# STE surrogate strength presets (smaller -> stronger ratio gradient):
+#   STE_TEMP=1.0 (recommended stable default)
+#   STE_TEMP=0.7 (balanced, previous default)
+#   STE_TEMP=0.5 (aggressive)
+STE_TEMP="${STE_TEMP:-1.0}"
+echo "[run_train] budget_ste_temperature=${STE_TEMP}"
+
+# max_pixels=12845056 (video clips to 786432/frame, seq~6K)
+# train target: layers 0 and 18 per-head budget ratio r (keep ceil(r*n_valid) top-QK keys)
+# loss: final task CE + budget regularization (no distill)
+# checkpoint every 0.05 epoch -> checkpoint-{step}/sparse_rel_pos_bias.pt
+accelerate launch \
+  --num_processes "${NUM_GPUS}" \
+  --num_machines 1 \
+  --mixed_precision bf16 \
+  --main_process_port 12348 \
+  train.py \
   --model_path /home/zhanghao360/model/Qwen3-VL-4B-Instruct \
   --output_dir /tmp/qwen3vl-sparse-attn \
   --max_pixels 12845056 \
@@ -31,21 +45,22 @@ accelerate launch --config_file ./accelerate_single_gpu.yaml train.py \
   --rel_pos_buckets 16384 \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 1 \
-  --num_train_epochs 0.25 \
-  --train_layer_id 18 \
+  --num_train_epochs 0.5 \
+  --train_layer_ids 0,18 \
+  --training_target budget \
+  --loss_mode task_ce \
+  --budget_granularity head \
+  --budget_init_ratio 0.3 \
+  --budget_lambda 0.08 \
+  --budget_ste_temperature "${STE_TEMP}" \
   --attn_implementation flash_attention_2 \
-  --learning_rate 0.1 \
-  --warmup_ratio 0.12 \
+  --learning_rate 0.008 \
+  --warmup_ratio 0.08 \
   --logging_steps 1 \
   --bf16 \
   --distill_every_n_steps 1 \
   "${RESUME_ARGS[@]}" \
   --report_to none \
-  --save_every_epoch_fraction 0.25 \
+  --save_every_epoch_fraction 0.05 \
   --save_at_end \
   "$@"
-
-# bash train/run_train.sh --rel_pos_init_path /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias.pt
-# layer0 backup: /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias_layer0.pt
-# layer18 backup: /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias_layer18.pt
-# layer18 backup: /tmp/qwen3vl-sparse-attn/final/sparse_rel_pos_bias_layer18.pt
