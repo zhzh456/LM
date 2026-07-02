@@ -28,7 +28,7 @@ STE_TEMP="${STE_TEMP:-1.0}"
 echo "[run_train] budget_ste_temperature=${STE_TEMP}"
 
 # max_pixels=12845056 (video clips to 786432/frame, seq~6K)
-# train target: layers 0 and 18 per-head budget ratio r (keep ceil(r*n_valid) top-QK keys)
+# train target: layer 0 per-head budget ratio r (keep ceil(r*n_valid) top-QK keys)
 # loss: final task CE + budget regularization (no distill)
 # checkpoint every 0.05 epoch -> checkpoint-{step}/sparse_rel_pos_bias.pt
 accelerate launch \
@@ -46,12 +46,12 @@ accelerate launch \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 1 \
   --num_train_epochs 0.5 \
-  --train_layer_ids 0,18 \
+  --train_layer_ids 0 \
   --training_target budget \
   --loss_mode task_ce \
   --budget_granularity head \
   --budget_init_ratio 0.3 \
-  --budget_lambda 0.08 \
+  --budget_lambda 0 \
   --budget_ste_temperature "${STE_TEMP}" \
   --attn_implementation flash_attention_2 \
   --learning_rate 0.008 \
