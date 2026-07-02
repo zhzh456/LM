@@ -51,7 +51,7 @@ accelerate launch \
   --loss_mode task_ce \
   --budget_granularity head \
   --budget_init_ratio 0.3 \
-  --budget_lambda 0.08 \
+  --budget_lambda 0 \
   --budget_ste_temperature "${STE_TEMP}" \
   --attn_implementation flash_attention_2 \
   --learning_rate 0.008 \
