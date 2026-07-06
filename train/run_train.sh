@@ -45,22 +45,22 @@ accelerate launch \
   --rel_pos_buckets 16384 \
   --per_device_train_batch_size 1 \
   --gradient_accumulation_steps 1 \
-  --num_train_epochs 0.5 \
+  --num_train_epochs 0.1 \
   --train_layer_ids 0 \
   --training_target budget \
   --loss_mode task_ce \
   --budget_granularity head \
-  --budget_init_ratio 0.3 \
+  --budget_init_ratio 0.01 \
   --budget_lambda 0 \
   --budget_ste_temperature "${STE_TEMP}" \
   --attn_implementation flash_attention_2 \
-  --learning_rate 0.008 \
+  --learning_rate 0.1 \
   --warmup_ratio 0.08 \
   --logging_steps 1 \
   --bf16 \
   --distill_every_n_steps 1 \
   "${RESUME_ARGS[@]}" \
   --report_to none \
-  --save_every_epoch_fraction 0.05 \
+  --save_every_epoch_fraction 0.2 \
   --save_at_end \
   "$@"
