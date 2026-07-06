@@ -36,9 +36,10 @@ def _load_one_dataset(
             ds = load_dataset("json", data_files={"train": jsonl_files}, split="train", token=None)
     else:
         hf_token = os.getenv("HF_TOKEN", None)
-        ds = load_dataset(dataset_name, split=split, token=hf_token)
-    if limit is not None and not os.path.isdir(dataset_name):
-        ds = ds.select(range(min(limit, len(ds))))
+        # Important for very large HF corpora (e.g. fineweb): when `limit` is set,
+        # slice at source to avoid preparing/downloading the full split first.
+        split_expr = f"{split}[:{limit}]" if limit is not None else split
+        ds = load_dataset(dataset_name, split=split_expr, token=hf_token)
     if text_field not in ds.column_names:
         raise ValueError(
             f"text_field='{text_field}' not found in dataset='{dataset_name}'. "

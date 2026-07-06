@@ -5,6 +5,12 @@ export http_proxy=http://10.229.18.27:8412
 export https_proxy=http://10.229.18.27:8412
 export HTTP_PROXY=http://10.229.18.27:8412
 export HTTPS_PROXY=http://10.229.18.27:8412
+# Keep HF cache off /home (often near full on this host).
+export HF_HOME="${HF_HOME:-/tmp/zh/hf}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+mkdir -p "${HF_DATASETS_CACHE}"
+# Silence numexpr thread-cap warning seen at startup.
+export NUMEXPR_MAX_THREADS="${NUMEXPR_MAX_THREADS:-128}"
 
 NUM_GPUS="${NUM_GPUS:-4}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
